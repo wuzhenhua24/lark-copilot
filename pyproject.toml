@@ -1,0 +1,9 @@
+[project]
+name = "lark-copilot"
+version = "0.1.0"
+description = "Personal Lark/Feishu copilot built on Claude Agent SDK — DM routing today, document drafting and multi-agent workflows next."
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.81",
+    "python-dotenv>=1.2.2",
+]
