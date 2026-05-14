@@ -156,6 +156,7 @@ uv sync
 | `COLLAB_SENDERS` | 受信任的 peer agent open_id（如 ops-qa-bot 的 bot open_id），逗号分隔可多个 |
 | `HUMAN_SENDERS` | 允许直接 DM 提问的真人 open_id，逗号分隔可多个 |
 | `DOC_QA_TIMEOUT_SEC` | 一次 doc_qa 的总超时（拉文档 + 推理），默认 55s |
+| `SESSION_TTL_MIN` | Human 模式会话空闲多少分钟后被回收，默认 30 |
 | `DRY_RUN` | `1` 只 log 不真发回复；`0` 真发。**首次跑保持 1。** |
 | `LARK_CLI` | lark-cli 可执行路径，默认 `lark-cli` |
 
@@ -175,23 +176,42 @@ uv run python router.py
 | `skip_untrusted_sender` | 发件人不在任一白名单 —— 想加入 Human 模式，把这一行的 `sender` 复制到 `HUMAN_SENDERS` |
 | `collab_in` / `human_in` | 命中对应白名单 |
 | `doc_qa_in` / `doc_fetched` / `doc_qa_done` | envelope 路径的 checkpoint |
-| `human_doc_qa_in` / `human_doc_qa_done` / `human_doc_qa_bad_input` | human 路径的 checkpoint |
+| `session_created` / `session_evict_idle` / `session_client_spawned` | Human 模式 per-chat 会话生命周期 |
+| `human_doc_qa_in` / `human_doc_qa_done` | human 路径单轮 checkpoint |
+| `human_doc_qa_fetch` / `human_doc_qa_docs_loaded` / `human_doc_qa_no_doc_followup` | 文档加载 / 单纯加载 / 没文档却追问 |
+| `human_doc_qa_reset` | 用户触发了 /reset |
 | `dry_run_send_ack` / `dry_run_send_text` | DRY_RUN 下要发的命令（实际没发） |
 | `send_ack_ok` / `send_text_ok` / `*_failed` | 真实回送结果 |
 
-### Human 模式怎么用
+### Human 模式怎么用（多轮对话版）
+
+#### 一次性配置
 
 1. 部署机起 router 后，从你**真人**飞书账号 DM 一下 lark-copilot bot（随便发一条）
 2. 在 router 日志里找 `skip_untrusted_sender`，复制 `sender` 字段（形如 `ou_xxxx`）
-3. 把它填到 `.env` 的 `HUMAN_SENDERS`，重启 router
-4. 再 DM bot 一条这样的消息：
+3. 填到 `.env` 的 `HUMAN_SENDERS`，重启 router
 
-   ```
-   https://xxx.feishu.cn/docx/XXXXXXX 这文档怎么处理 OOM 流程？
-   ```
+#### 对话
 
-   bot 会拉文档、跑 QA、把答案纯文本回给你。第一个飞书 URL 当 doc，剩下文本当问题。
-   缺 URL 或缺问题会用人话提示。
+每个 chat（你和 bot 的 1v1）维护一份会话状态：
+
+- 一份 **ClaudeSDKClient**：多轮对话历史在它内部，能记住上一轮的文档和回答
+- 一份 **doc cache**：URL → Markdown，避免同一文档被重复拉取
+- 一个 **last_active 时间戳**：`SESSION_TTL_MIN` 分钟无活动 → 整份状态被丢弃
+
+支持的输入：
+
+| 你发 | bot 行为 |
+|---|---|
+| `<URL> 这文档讲了啥` | 拉文档、入缓存、回答 |
+| `<URL1> <URL2> 对比一下这两份文档` | 同时拉两篇、入缓存、回答 |
+| `刚才那段 OOM 处置具体怎么做？` | 复用上一轮文档，直接回答（无需重贴 URL） |
+| `<新 URL>` | 只加载，不回答；回一个"已加载 N 篇文档"的确认 |
+| `<新 URL> 新问题` | 加载新文档（旧的也仍在）+ 用所有缓存文档作答 |
+| `/reset` / `/new` / `重置` / `清空` | 清空当前会话状态，下次重新开始 |
+
+⚠️ **多轮的代价**：每次新加文档都会把它整段塞进对话历史。文档越多 / 轮次越多，
+单次 prompt 越大。撑爆上下文了 bot 会报模型错误——这时发 `/reset` 重开就行。
 
 ---
 

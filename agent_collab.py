@@ -24,8 +24,12 @@ Envelope（单行 JSON 文本消息）:
        或 {"op":"doc_qa_ack","req_id":"<same>","ok":false,"error":"..."}
 
 另外暴露一条 `handle_human_doc_qa`：给 HUMAN_SENDERS 白名单里的真人用户用，
-DM 里贴飞书 URL + 自然语言问题就行，答案作为纯文本回。复用同一套
-fetch + Claude QA 管道，错误也用人话回。
+DM 里贴飞书 URL + 自然语言问题就行，答案作为纯文本回。**支持多轮**：
+- 每个 chat_id 维护一个 `ChatSession`（一个 ClaudeSDKClient + 文档缓存）
+- 后续追问可以省 URL，会复用之前缓存的文档
+- 单条消息可以同时贴多个 URL
+- `/reset` / `/new` / `重置` / `清空` 任一可清空当前对话
+- `SESSION_TTL_MIN`（默认 30 分钟）无活动自动过期
 """
 
 from __future__ import annotations
@@ -36,11 +40,13 @@ import os
 import re
 import shlex
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     TextBlock,
     query,
 )
@@ -283,40 +289,147 @@ async def handle_doc_qa(evt: dict) -> None:
         log("doc_qa_error", req_id=req_id, error=str(ex)[:300])
 
 
-# --- human mode (plain text in, plain text out) -----------------------------
+# --- human mode (plain text in, plain text out, multi-turn) -----------------
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 # 粘 URL 时常见的尾巴标点；URL 里这些字符出现也少见，剔了对 fetch 更友好
 URL_TRAILING_PUNCT = ".,;:)]}>'\"'。，；"
 
-HUMAN_HELP_NO_URL = (
-    "没看到飞书文档链接。把文档 URL 和问题一起发过来就行，比如：\n"
-    "https://xxx.feishu.cn/docx/XXX 这文档怎么处理 OOM"
-)
-HUMAN_HELP_NO_QUESTION = (
-    "贴了文档但没看到问题。再发一次时把问题也带上，比如：\n"
-    "<URL> 这文档怎么处理 OOM"
-)
+# 任一作为单独消息（trim 后等于命令本身）触发会话重置
+RESET_COMMANDS = {"/reset", "/new", "重置", "清空"}
+
+SESSION_TTL_SEC = float(os.environ.get("SESSION_TTL_MIN", "30")) * 60
+
+HUMAN_SYSTEM_PROMPT = """你是飞书文档问答助手。用户会陆续给你一篇或多篇飞书文档（以 <document url="..."> 块的形式提供），并基于这些文档跟你多轮提问。
+
+规则：
+- 只基于已提供的文档回答；文档里没有的信息直接说"文档里没找到"，不要凭常识补
+- 用户的追问通常仍然指当前已提供的文档；除非问题明显跑题，否则按这些文档作答
+- 答得简洁。需要步骤就用编号列表
+- 不要把整段文档抄回来当作答案
+- 同时引用多篇文档时，注明引用了哪一篇（用 url 或简短的来源标识）
+"""
 
 
-def parse_human_request(text: str) -> tuple[str | None, str | None, str | None]:
-    """把一段自然语言切成 (doc_url, question, error)。
+def extract_urls(text: str) -> list[str]:
+    """从文本里抠出所有 URL，剔掉常见尾巴标点，保持原顺序、去重。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in URL_RE.finditer(text or ""):
+        url = m.group(0).rstrip(URL_TRAILING_PUNCT)
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
 
-    成功：返回 (url, question, None)。
-    失败：返回 (None, None, 人话错误提示)，让上层直接发回 chat。
+
+def strip_urls(text: str) -> str:
+    """把所有 URL 从文本里抠掉，留剩余文字。"""
+    return URL_RE.sub("", text or "").strip()
+
+
+# --- per-chat session state --------------------------------------------------
+
+@dataclass
+class ChatSession:
+    chat_id: str
+    client: ClaudeSDKClient | None              # 真正第一次问问题时才 spawn
+    doc_cache: dict[str, str] = field(default_factory=dict)         # url -> markdown
+    docs_in_client_context: set[str] = field(default_factory=set)   # 已塞进对话历史的 url
+    last_active: float = field(default_factory=time.time)
+
+    def is_idle(self, ttl_sec: float) -> bool:
+        return (time.time() - self.last_active) > ttl_sec
+
+    def touch(self) -> None:
+        self.last_active = time.time()
+
+
+class SessionManager:
+    """per-chat 多轮会话状态。
+
+    并发模型：
+    - 每个 chat_id 一把 asyncio.Lock，所有访问该 chat 的代码都得拿它。
+    - 不同 chat 的请求真正并行（每个 chat 独立 ClaudeSDKClient，互不阻塞）。
+    - 同一 chat 的连续两条消息串行，避免对话历史交错。
+
+    生命周期：
+    - 创建：第一次有 user 发消息时（仅加载文档不开 client）
+    - 触发 client spawn：用户第一次真正问问题
+    - 销毁：用户发 /reset 等命令、或 lazy idle eviction
+    - 进程退出：subprocess 由 OS 兜底回收；本期不做优雅 shutdown
     """
-    if not text or not text.strip():
-        return None, None, "消息是空的，请贴文档链接 + 问题。"
-    m = URL_RE.search(text)
-    if not m:
-        return None, None, HUMAN_HELP_NO_URL
-    doc_url = m.group(0).rstrip(URL_TRAILING_PUNCT)
-    # 把第一个 URL 抠掉（不动后面可能出现的 URL，全部留在 question 里
-    # 让 Claude 自己判断要不要管），剩下的当问题。
-    question = (text[: m.start()] + text[m.end():]).strip()
-    if not question:
-        return None, None, HUMAN_HELP_NO_QUESTION
-    return doc_url, question, None
+
+    def __init__(self, options: ClaudeAgentOptions, ttl_sec: float):
+        self._options = options
+        self._ttl = ttl_sec
+        self._sessions: dict[str, ChatSession] = {}
+        self._chat_locks: dict[str, asyncio.Lock] = {}
+        self._dict_lock = asyncio.Lock()
+
+    async def lock_for(self, chat_id: str) -> asyncio.Lock:
+        async with self._dict_lock:
+            lock = self._chat_locks.get(chat_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._chat_locks[chat_id] = lock
+            return lock
+
+    async def get_or_create(self, chat_id: str) -> ChatSession:
+        """返回 chat_id 的 session；不存在或已过期就新建。
+
+        调用方**必须**先持有 lock_for(chat_id)。
+        """
+        sess = self._sessions.get(chat_id)
+        if sess and sess.is_idle(self._ttl):
+            log("session_evict_idle", chat_id=chat_id)
+            await self._destroy_locked(chat_id)
+            sess = None
+        if sess is None:
+            sess = ChatSession(chat_id=chat_id, client=None)
+            self._sessions[chat_id] = sess
+            log("session_created", chat_id=chat_id)
+        return sess
+
+    async def ensure_client(self, sess: ChatSession) -> ClaudeSDKClient:
+        """第一次真要 query 时再 spawn Claude Code 子进程。"""
+        if sess.client is None:
+            client = ClaudeSDKClient(options=self._options)
+            await client.connect()
+            sess.client = client
+            log("session_client_spawned", chat_id=sess.chat_id)
+        return sess.client
+
+    async def reset(self, chat_id: str) -> bool:
+        """显式销毁。调用方持有 lock_for(chat_id)。返回是否真的销毁了。"""
+        return await self._destroy_locked(chat_id)
+
+    async def _destroy_locked(self, chat_id: str) -> bool:
+        sess = self._sessions.pop(chat_id, None)
+        if sess is None:
+            return False
+        if sess.client is not None:
+            try:
+                await sess.client.disconnect()
+            except Exception as ex:  # noqa: BLE001
+                log("session_client_disconnect_error", chat_id=chat_id, error=str(ex)[:200])
+        return True
+
+
+# 模块级单例，第一次访问才初始化（避免 import 时就读 env / 初始化 SDK options）
+_session_manager: SessionManager | None = None
+
+
+def _get_session_manager() -> SessionManager:
+    global _session_manager
+    if _session_manager is None:
+        options = ClaudeAgentOptions(
+            system_prompt=HUMAN_SYSTEM_PROMPT,
+            allowed_tools=[],
+            max_turns=1,
+        )
+        _session_manager = SessionManager(options=options, ttl_sec=SESSION_TTL_SEC)
+    return _session_manager
 
 
 async def send_text_reply(chat_id: str, text: str) -> None:
@@ -347,11 +460,33 @@ async def send_text_reply(chat_id: str, text: str) -> None:
         log("send_text_ok", chat_id=chat_id)
 
 
-async def handle_human_doc_qa(evt: dict) -> None:
-    """处理真人 DM 的 doc QA 请求。
+async def _run_client_turn(client: ClaudeSDKClient, user_msg: str) -> str:
+    """跑一轮：query 一段 user message + 收一轮 assistant 回复，拼成纯文本。"""
+    await client.query(user_msg)
+    out: list[str] = []
+    async for msg in client.receive_response():
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    out.append(block.text)
+    return "".join(out).strip()
 
-    输入是自然语言（不是 envelope），输出也是自然语言。其它逻辑与 envelope
-    版本一致：fetch_doc_as_markdown + answer_from_doc，超时按 40/60 切。
+
+async def handle_human_doc_qa(evt: dict) -> None:
+    """处理真人 DM 的多轮 doc QA。
+
+    输入：自然语言（可贴 0-N 个飞书 URL + 可选问题）。
+    输出：纯文本答案 / 加载确认 / 错误提示。
+
+    流程（持有 per-chat 锁内）：
+    1. 文本是重置命令 → reset session、回确认
+    2. 抠出新 URL（不在缓存里的），逐个 fetch 进缓存
+    3. 没问题、只加载文档 → 回确认就停（client 不开）
+    4. 有问题 → 确保 client 已 spawn，把"还没塞进对话历史的文档 + 问题"作为一轮发出去
+    5. touch session 续命
+
+    `/reset`、`/new`、`重置`、`清空` 任一作为单独消息时清空当前对话。
+    超过 SESSION_TTL_MIN 分钟没有活动会被 lazy evict。
     """
     text = (evt.get("text") or "").strip()
     chat_id = evt.get("chat_id")
@@ -359,39 +494,122 @@ async def handle_human_doc_qa(evt: dict) -> None:
         log("human_doc_qa_no_chat_id")
         return
 
-    doc_url, question, err = parse_human_request(text)
-    if err:
-        log("human_doc_qa_bad_input", preview=text[:120])
-        await send_text_reply(chat_id, err)
-        return
+    mgr = _get_session_manager()
+    lock = await mgr.lock_for(chat_id)
+    async with lock:
+        if text in RESET_COMMANDS:
+            ok = await mgr.reset(chat_id)
+            await send_text_reply(
+                chat_id,
+                "✅ 已重置对话。下次贴一个飞书文档链接 + 问题开始新一轮。"
+                if ok else
+                "目前没有活跃对话可以重置。直接贴文档 + 问题就行。",
+            )
+            log("human_doc_qa_reset", chat_id=chat_id, had_session=ok)
+            return
 
-    log("human_doc_qa_in", doc=doc_url, q_preview=question[:80])
-    started = time.time()
-    try:
-        doc_md = await asyncio.wait_for(
-            fetch_doc_as_markdown(doc_url),
-            timeout=DOC_QA_TIMEOUT_SEC * 0.4,
+        sess = await mgr.get_or_create(chat_id)
+        urls = extract_urls(text)
+        new_urls = [u for u in urls if u not in sess.doc_cache]
+        question = strip_urls(text)
+
+        if not urls and not question:
+            await send_text_reply(chat_id, "消息是空的。请把问题（和文档链接）发过来。")
+            return
+
+        if not sess.doc_cache and not new_urls and question:
+            await send_text_reply(
+                chat_id,
+                "这是新对话，还没加载任何文档。请把飞书文档链接和问题一起发过来。",
+            )
+            log("human_doc_qa_no_doc_followup", chat_id=chat_id)
+            return
+
+        # 拉新文档
+        if new_urls:
+            log("human_doc_qa_fetch", chat_id=chat_id, count=len(new_urls))
+            for url in new_urls:
+                try:
+                    md = await asyncio.wait_for(
+                        fetch_doc_as_markdown(url),
+                        timeout=DOC_QA_TIMEOUT_SEC * 0.4,
+                    )
+                except asyncio.TimeoutError:
+                    await send_text_reply(chat_id, f"⌛ 拉文档超时：{url}")
+                    log("human_doc_qa_fetch_timeout", chat_id=chat_id, url=url)
+                    return
+                except Exception as ex:  # noqa: BLE001
+                    await send_text_reply(
+                        chat_id,
+                        f"❌ 拉文档失败：{url}\n{type(ex).__name__}: {str(ex)[:200]}",
+                    )
+                    log("human_doc_qa_fetch_error", chat_id=chat_id, url=url, error=str(ex)[:300])
+                    return
+                sess.doc_cache[url] = md
+            sess.touch()
+
+        # 只加载文档没问题 → 确认即停（不浪费一轮 Claude 推理）
+        if not question:
+            listing = "\n".join(f"- {u}" for u in new_urls)
+            await send_text_reply(
+                chat_id,
+                f"📄 已加载 {len(new_urls)} 篇文档：\n{listing}\n\n继续把问题发过来即可。",
+            )
+            log("human_doc_qa_docs_loaded", chat_id=chat_id, loaded=len(new_urls), total=len(sess.doc_cache))
+            return
+
+        # 有问题 → 跑 Claude
+        try:
+            client = await mgr.ensure_client(sess)
+        except Exception as ex:  # noqa: BLE001
+            await send_text_reply(
+                chat_id,
+                f"❌ 启动模型失败：{type(ex).__name__}: {str(ex)[:200]}",
+            )
+            log("session_client_spawn_failed", chat_id=chat_id, error=str(ex)[:300])
+            return
+
+        # 这次需要补发哪些文档到对话历史里
+        to_inject = [u for u in sess.doc_cache if u not in sess.docs_in_client_context]
+        parts: list[str] = []
+        for url in to_inject:
+            parts.append(f'<document url="{url}">\n{sess.doc_cache[url]}\n</document>')
+        parts.append(f"<question>\n{question}\n</question>")
+        user_msg = "\n\n".join(parts)
+
+        log(
+            "human_doc_qa_in",
+            chat_id=chat_id,
+            q_preview=question[:80],
+            inject_docs=len(to_inject),
+            total_docs=len(sess.doc_cache),
         )
-        log("doc_fetched", bytes=len(doc_md))
-        answer = await asyncio.wait_for(
-            answer_from_doc(question, doc_md),
-            timeout=DOC_QA_TIMEOUT_SEC * 0.6,
-        )
-        await send_text_reply(chat_id, answer)
+        started = time.time()
+        try:
+            answer = await asyncio.wait_for(
+                _run_client_turn(client, user_msg),
+                timeout=DOC_QA_TIMEOUT_SEC * 0.6,
+            )
+        except asyncio.TimeoutError:
+            await send_text_reply(
+                chat_id,
+                "⌛ 推理超时。文档可能太长，或者临时网络抖了一下。可以试着 /reset 重开或简化问题。",
+            )
+            log("human_doc_qa_timeout", chat_id=chat_id, took_ms=int((time.time() - started) * 1000))
+            return
+        except Exception as ex:  # noqa: BLE001
+            await send_text_reply(chat_id, f"❌ 模型出错：{type(ex).__name__}: {str(ex)[:200]}")
+            log("human_doc_qa_error", chat_id=chat_id, error=str(ex)[:300])
+            return
+
+        for url in to_inject:
+            sess.docs_in_client_context.add(url)
+        sess.touch()
+
+        await send_text_reply(chat_id, answer or "（模型未输出文本）")
         log(
             "human_doc_qa_done",
+            chat_id=chat_id,
             took_ms=int((time.time() - started) * 1000),
             answer_len=len(answer),
         )
-    except asyncio.TimeoutError:
-        await send_text_reply(
-            chat_id,
-            "⌛ 超时了：拉文档或推理时间过长（默认 55s）。文档可能太大，或者临时网络抖了一下，可以稍后重试。",
-        )
-        log("human_doc_qa_timeout", took_ms=int((time.time() - started) * 1000))
-    except Exception as ex:  # noqa: BLE001
-        await send_text_reply(
-            chat_id,
-            f"❌ 出错了：{type(ex).__name__}: {str(ex)[:200]}",
-        )
-        log("human_doc_qa_error", error=str(ex)[:300])
