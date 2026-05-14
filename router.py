@@ -22,12 +22,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 from collections.abc import AsyncIterator
 
 from dotenv import load_dotenv
 
 import agent_collab
+
+# Windows 控制台默认 cp936/cp1252，NDJSON 里的中文会乱码 / Mac & Linux 默认就是 UTF-8。
+# 入口处把 stdout/stderr 强制成 UTF-8，跨平台行为一致。Python 3.7+ 的 TextIOWrapper
+# 支持 reconfigure；在还没写过任何东西时调用是安全的（这里就在 import 之后、log 之前）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
 
 load_dotenv()
 
@@ -113,7 +123,9 @@ async def stream_events() -> AsyncIterator[str]:
                 rc = await proc.wait()
                 log("consume_exited", rc=rc)
                 break
-            yield line.decode().rstrip("\n")
+            # rstrip() 而非 rstrip("\n")：Windows 下 lark-cli 输出可能是 CRLF，
+            # 只剥 \n 会留下 \r 污染下游字符串比较（白名单匹配等）。
+            yield line.decode().rstrip()
     finally:
         if proc.returncode is None:
             proc.terminate()

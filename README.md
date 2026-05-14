@@ -244,6 +244,20 @@ lark-copilot/
 
 ---
 
+## Windows 部署须知
+
+代码已经做了跨平台兼容（UTF-8 stdout、CRLF 容忍），但有几点 Windows 用户需要单独注意：
+
+| 注意点 | 说明 |
+|---|---|
+| 控制台编码 | router.py 入口已 `sys.stdout.reconfigure(encoding="utf-8")`，正常运行不会乱码。但**如果你重定向到第三方 log 收集（如 nssm）**，对方可能仍按系统 locale 解码，建议在启动前 `chcp 65001` 或 `set PYTHONIOENCODING=utf-8` |
+| `proc.terminate()` 行为 | Windows 上等同 SIGKILL，lark-cli 拿不到 graceful shutdown 机会。如果遇到 lark-cli event daemon 卡住，手动 `lark-cli event reset` 一下 |
+| DRY_RUN 日志里的命令字符串 | 用的是 Unix shell 引号（`shlex.quote`），**直接复制到 cmd / PowerShell 跑不通**。只是日志展示问题，实际执行走 list-form `create_subprocess_exec`，正常 |
+| lark-cli 二进制 | 用官方 Windows release，丢到 PATH 上即可。`LARK_CLI=lark-cli` 会自动找 `lark-cli.exe` |
+| Claude Code CLI | `ClaudeSDKClient` 依赖部署机的 Claude Code。Windows 装好桌面 app 或 CLI 后 `claude auth login` 跑一次，SDK 自动复用 |
+
+---
+
 ## 故障排查
 
 | 现象 | 排查方向 |
