@@ -99,6 +99,149 @@ lark-copilot 做的事：
 
 ---
 
+## 企业部署：飞书应用准备
+
+本项目运行依赖 `lark-cli`，而 `lark-cli` 本身必须挂在一个**飞书自建应用**上 ——
+应用提供 `app_id` / `app_secret` 和可申请的 scope 范围，`lark-cli auth login` 的
+OAuth 授权也是走这个应用。所以在公司部署前，先把应用准备好。
+
+### 层级关系
+
+```
+企业飞书应用 (app_id / app_secret + scope 白名单 + 事件订阅)
+        │  提供 OAuth 容器
+        ▼
+   lark-cli (本地 config 持有 app credentials)
+        │  浏览器 OAuth → 每个运行人各自的 user token
+        ▼
+   router.py / agent_collab.py (subprocess 调用 lark-cli, 不直接持 token)
+```
+
+注意身份关系：
+
+- router.py 发消息走 `--as user`，对方看到的是「**你本人**」回的私聊，不是机器人
+- 所以这个应用在用户视角是「幕后的 OAuth 容器」，不是 bot 实体
+- agent_collab 协议里的 `COLLAB_SENDERS`（对端 bot open_id）是 **ops-qa-bot 那侧的应用**，
+  跟本仓库挂的这个应用是两个不同的 app
+
+### 在企业后台要做的事
+
+1. 在企业飞书开发者后台创建一个**企业自建应用**（无需发布应用市场，可见范围给内部成员即可）
+2. 在该应用的「权限管理」里勾选下列 scope。
+   **关键：本项目所有飞书调用都走 `--as user`，所以全部勾在「用户身份权限」一列，
+   「应用身份权限」一列不需要勾任何东西。**
+
+   | scope | 身份列 | 谁用 | 用途 |
+   |---|---|---|---|
+   | `im:message` | 用户身份 | router.py | 订阅 `im.message.receive_v1`（收 DM） |
+   | `im:message:send_as_user` | 用户身份 | router.py | 以 user 身份发 DM（scope 本身就是 user-only） |
+   | `docx:document:readonly` | 用户身份 | agent_collab.py | `lark-cli docs +fetch` 拉飞书文档 |
+   | `drive:drive:readonly` | 用户身份（可选） | agent_collab.py | 搜云空间 |
+   | `contact:user.base:readonly` | 用户身份（可选） | router.py | 日志里把 open_id 解析成姓名 |
+
+   为什么不勾应用身份：
+
+   - 应用身份权限走 `tenant_access_token`，是「以 bot 名义操作」。本项目对方看到的
+     是「你本人」回私聊，不是 bot 发的，全程用不到 tenant token
+   - 应用身份能拉到的文档/联系人受限于「应用可见范围 + 文档主动分享给 bot」；
+     用户身份直接复用你的飞书账号权限，覆盖面正好是项目想要的范围
+   - 事件订阅 `im.message.receive_v1` 在应用身份下推的是「@ 机器人的消息」，
+     在用户身份下推的才是「发给你本人的 DM」—— 我们要的是后者
+
+3. 在「事件与回调」里：
+   - 「网关」选 **长连接（WebSocket）** —— `lark-cli event consume` 走这条通道，
+     不需要公网回调地址、不需要配 redirect URL
+   - 「事件订阅」展开**「应用身份订阅」**列表，添加 `im.message.receive_v1`。
+     ⚠️ 这个事件只能在「应用身份订阅」里加，「用户身份订阅」列表里**没有**它 ——
+     这是平台对事件的归类，不代表事件按 bot 身份投递（见下方说明）
+   - 添加事件后，平台会**强制要求**勾上一批**应用身份 scope**
+     （如 `im:message.group_at_msg:readonly`、`im:message.p2p_msg:readonly`）。
+     按提示勾上即可 —— 这只是事件注册的合法性声明，不影响运行时行为（详见下方"应用身份 scope 强制项"）
+   - 另外，本项目用到的 `im:message`、`im:message:send_as_user` 等业务 scope，
+     去权限管理把它们勾在**用户身份**那一列
+4. 把 `app_id` / `app_secret` 配进部署机的 lark-cli 配置（见 lark-cli 文档的 `config init`）
+5. 每个运行 router 的人，在自己的部署机上跑一次 `lark-cli auth login`，
+   浏览器 OAuth 授权这个应用，拿到**属于自己的 user token**（存在 lark-cli 本地 config 里）
+
+#### 为什么「事件订阅在应用身份」但「scope 在用户身份」
+
+这是两件独立的事，容易混。心智模型：
+
+| 层 | 决定什么 | 本项目设置 |
+|---|---|---|
+| **事件注册** | 应用是否监听某类事件 | 应用身份订阅 → 添加 `im.message.receive_v1` |
+| **权限 scope** | 哪种身份的 token 能解开事件载荷 | 用户身份权限 → 勾 `im:message` 等 |
+| **运行时投递** | 用什么 token 接长连接，决定看到谁的视角 | `lark-cli` 用 user token 接 WebSocket |
+
+事件**注册**只在应用身份订阅里 —— 这是平台分类，没得选。但事件**投递**按接长连接的
+token 身份过滤：
+
+- 用 tenant token 接 → 收 bot 视角的（@bot、bot 所在群的消息）
+- 用 user token 接 → 收**该用户视角**的（发给该用户的 DM、@该用户的消息）—— 这是本项目要的
+
+所以「事件订阅在哪一列」和「scope 在哪一列」**不需要对齐**，按上表各自就位即可。
+
+#### 应用身份 scope 强制项（注册事件时被平台拉进来的）
+
+把 `im.message.receive_v1` 加到「应用身份订阅」后，平台会要求声明一批
+**应用身份** scope，常见的：
+
+- `im:message.group_at_msg:readonly` —— 读群里 @bot 的消息
+- `im:message.p2p_msg:readonly` —— 读发给 bot 的 DM
+- `im:resource`（若提示则需）—— 读消息中的富文本/附件资源
+
+**按提示勾上即可，不会改变运行时行为**：
+
+1. 这些 scope 是**事件注册的合法性声明**，不是运行时调用授权 ——
+   平台规则是"既然订阅了这类事件，应用层就得声明能读这类消息"
+2. 本项目代码**从不使用 `tenant_access_token`**（router.py / agent_collab.py 全程 `--as user`），
+   所以这些 scope 即便授予，也没有 code path 去用
+3. 真正决定运行时能拿到什么的，是「lark-cli 用 user token 接 WebSocket」+
+   「用户身份 `im:message` scope」—— 这条链路不变
+
+**连带影响**：这些 app-identity scope 通常**绑定在「机器人」能力上**，所以你可能需要
+顺便把「应用能力 → 机器人」启用。bot 只是形式上的占位 —— 不用起名、不用拉进任何群、
+不用任何人 DM 它。若想进一步降噪，可以把 bot 的"允许被搜索"、"允许被加入群聊"关掉。
+
+**安全视角**：
+
+| 担心 | 实际风险 |
+|---|---|
+| bot 拿到 @它的消息会被本项目处理吗 | 不会。代码从不用 tenant token 连 WebSocket，bot 视角的事件不会进 router |
+| 攻击者能利用 bot 身份 scope 做事吗 | 需先拿到 `app_secret`。跟"勾不勾这些 scope"无关，是 secret 保管问题 |
+| 用户身份 scope 会被悄悄扩大吗 | 不会。用户身份权限那列单独勾选，跟应用身份互不影响 |
+
+### 应用配置一览（不是 scope，是开关）
+
+除了上面的 scope 勾选，应用本身还要满足这些前提：
+
+| 配置项 | 在哪里 | 应为 | 备注 |
+|---|---|---|---|
+| 应用启用 | 应用基础信息 | 启用 | 关掉的话什么都不通 |
+| 可见范围 | 应用基础信息 → 可见范围 | 包含运行 router 的同事 | 不在范围内的人 OAuth 时会被拒 |
+| 事件订阅网关 | 事件与回调 → 网关 | 长连接（WebSocket） | 不需要公网回调地址 |
+| 订阅事件 | 事件与回调 → **应用身份订阅** | `im.message.receive_v1` | 用户身份订阅列表里没有此事件；按上文说明，注册位置和 scope 位置不需要对齐 |
+| 用户身份权限 | 权限管理 → 用户身份权限 | 勾上前面列的 5 个 scope | 应用身份那列全空 |
+| 版本发布 | 版本管理 | 改完 scope 要发新版并过管理员审核 | 容易忘 —— 没发版的话 OAuth 拿不到新 scope |
+
+### 不需要做的事 / 容易踩的点
+
+- 「机器人」能力**可能要顺手开**（因为订阅 `im.message.receive_v1` 会拉进若干
+  app-identity scope，那些 scope 绑在 bot 能力上）—— 但它只是占位，运行时不被使用，
+  代码不发 bot 消息也不接 bot @ 事件，详见上文"应用身份 scope 强制项"
+- **不需要**配 redirect URL —— `lark-cli auth login` 用 device flow / 本地回调，不走 Web OAuth redirect
+- **不需要**配「网页应用」「小程序」之类的能力
+- 加完 scope **必须重新发版并过管理员审核**，否则新登录的用户拿不到新权限
+- 已经登录过 lark-cli 的人，scope 变更后要 `lark-cli auth logout` + `lark-cli auth login`
+  重走一次 OAuth，否则 token 里还是旧 scope
+
+### 多人复用同一个应用
+
+一般做法是「一个公共企业应用 + 每人各自 OAuth + lark-cli config 各存各的 token」。
+应用本身共享，scope 在应用层一次配齐；token 是 per-user 的，互不影响。
+
+---
+
 ## 快速开始
 
 ### 1. 准备环境
@@ -113,6 +256,9 @@ uv sync
 依赖：`claude-agent-sdk`、`python-dotenv`。
 
 ### 2. 安装并登录 lark-cli
+
+前提：已按上文「[企业部署：飞书应用准备](#企业部署飞书应用准备)」准备好飞书应用、
+lark-cli 本地已配好 `app_id` / `app_secret`。
 
 按 [lark-cli 文档](https://github.com/larksuite/lark-cli) 安装后，授权所需 scope：
 
