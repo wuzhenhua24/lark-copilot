@@ -17,7 +17,6 @@ import asyncio
 import json
 import os
 import shlex
-import sys
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -36,7 +35,6 @@ load_dotenv()
 
 GROUP_NAME = os.environ.get("GROUP_NAME", "测试环境支持群")
 GROUP_BOT_NAME = os.environ.get("GROUP_BOT_NAME", "测试环境助手")
-GROUP_LINK = os.environ.get("GROUP_LINK", "")
 DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
 COOLDOWN_HOURS = float(os.environ.get("COOLDOWN_HOURS", "24"))
 LARK_CLI = os.environ.get("LARK_CLI", "lark-cli")
@@ -53,8 +51,7 @@ COLLAB_SENDERS = {
 
 REDIRECT_TEMPLATE = (
     "嗨～测试环境相关的问题，麻烦移步「{group_name}」群里 @{group_bot_name} 直接问哈，"
-    "那边有机器人秒回，也比我私聊查得准。\n"
-    "群链接：{group_link}\n\n"
+    "那边有机器人秒回，也比我私聊查得准。\n\n"
     "（这条是我设置的自动回复，私聊这类问题就先不一一回了 🙏）"
 )
 
@@ -182,7 +179,6 @@ async def send_redirect(chat_id: str) -> None:
     text = REDIRECT_TEMPLATE.format(
         group_name=GROUP_NAME,
         group_bot_name=GROUP_BOT_NAME,
-        group_link=GROUP_LINK,
     )
     cmd = [
         LARK_CLI, "im", "+messages-send",
@@ -272,8 +268,6 @@ async def handle(evt: dict) -> None:
 
 
 async def main() -> None:
-    if not GROUP_LINK:
-        print("WARN: GROUP_LINK is empty — redirect text will have an empty link.", file=sys.stderr)
     async for line in stream_events():
         if not line.strip():
             continue
