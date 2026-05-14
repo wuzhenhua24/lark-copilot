@@ -1,26 +1,27 @@
 """
 lark-copilot · agent_collab
 
-第二个 capability：作为 ops-qa-bot 的"飞书外设"。
+作为 ops-qa-bot 的"飞书外设"——doc QA worker。
 
-场景：ops-qa-bot 部署在内网，没有 user-scope 的飞书文档访问能力；本进程
-跑在能访问飞书文档的机器上，对外以 user 身份接 DM。约定的"协作机器人"
-ops-qa-bot 给我发一条结构化 DM（JSON envelope），我去飞书拉文档、跑 Claude
-回答、把答案再发回去。
+场景：ops-qa-bot 部署在内网，bot 身份没有 user-scope 的飞书文档访问能力；本进程
+跑在能访问飞书文档的部署机上，登录 user 持有 docx 读权限。peer agent
+（ops-qa-bot）给本仓库的 **lark-copilot bot** 发一条结构化 DM envelope，本进程
+用 user OAuth 拉飞书文档、跑 Claude 回答、再用 bot 身份发 ack 回去。
+
+身份分工（同进程内 per-command 切换）：
+- 监听事件：`event consume im.message.receive_v1 --as bot`（在 router.py 里）
+- 拉文档：`docs +fetch --as user`（user OAuth 持有文档读权限）
+- 发 ack：`im +messages-send --as bot`（事件是 bot 收到的，回复也由 bot 发）
 
 为什么用飞书 IM 当传输：
 - ops-qa-bot 内网，对外网络出口受限，飞书 IM 是它已经走通的唯一双向通道
 - 双方都已经接通飞书，零网络改造
-- 鉴权天然：发件人 open_id 就是身份，路由层按 sender 短路
+- 鉴权天然：发件人 open_id 就是身份，router 按 sender 白名单过滤
 
 Envelope（单行 JSON 文本消息）:
     请求: {"op":"doc_qa","req_id":"<correlation-id>","doc":"<feishu-url>","q":"<question>"}
     回复: {"op":"doc_qa_ack","req_id":"<same>","ok":true,"answer":"..."}
        或 {"op":"doc_qa_ack","req_id":"<same>","ok":false,"error":"..."}
-
-router.py 在 `handle()` 入口看到 sender == OPS_QA_BOT_OPEN_ID 时短路到这里，
-不走 TEST_ENV 分类。
-
 """
 
 from __future__ import annotations
@@ -191,7 +192,7 @@ async def send_envelope_reply(chat_id: str, payload: dict[str, Any]) -> None:
     text = json.dumps(payload, ensure_ascii=False)
     cmd = [
         LARK_CLI, "im", "+messages-send",
-        "--as", "user",
+        "--as", "bot",
         "--chat-id", chat_id,
         "--text", text,
     ]

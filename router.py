@@ -1,14 +1,18 @@
 """
-lark-copilot · dm router
+lark-copilot · dispatcher
 
-First capability of the lark-copilot project. Listens to your incoming
-Lark/Feishu DMs via `lark-cli event consume`, classifies each one with Claude
-(test-env support question or not), and on a match auto-replies with a redirect
-to your group + group bot. Group chats are ignored; cooldown prevents replying
-to the same person twice.
+薄薄一层 dispatcher：把飞书 IM 事件流分发到具体的 capability handler。
 
-Other capabilities (doc drafting, multi-agent workflows) will live alongside
-this module as the project grows.
+当前只有一个 handler —— `agent_collab.handle_doc_qa`：接收来自受信任 peer agent
+（典型如 ops-qa-bot）的 doc_qa envelope，去飞书拉文档、跑 Claude 答题、再 ack 回去。
+
+身份与限制：
+- `im.message.receive_v1` 事件在飞书 Open Platform 是**应用级**的，只支持 `--as bot`
+  订阅。没有"以 user 身份订阅自己收到的 DM"这条路径。
+- 所以这一侧 router 跑 `--as bot`，监听的是 **lark-copilot bot 收到的 DM**；peer agent
+  发 envelope 时也得 DM 这个 bot。
+- 文档拉取（`agent_collab.fetch_doc_as_markdown`）继续走 `--as user`，因为 docx 读权限
+  挂在登录 user 的 OAuth 上。两个身份在同一进程里 per-command 切换没问题。
 """
 
 from __future__ import annotations
@@ -16,95 +20,27 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shlex
 import time
 from collections.abc import AsyncIterator
-from pathlib import Path
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    TextBlock,
-    query,
-)
 from dotenv import load_dotenv
 
 import agent_collab
 
 load_dotenv()
 
-GROUP_NAME = os.environ.get("GROUP_NAME", "测试环境支持群")
-GROUP_BOT_NAME = os.environ.get("GROUP_BOT_NAME", "测试环境助手")
-DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
-COOLDOWN_HOURS = float(os.environ.get("COOLDOWN_HOURS", "24"))
 LARK_CLI = os.environ.get("LARK_CLI", "lark-cli")
-STATE_FILE = Path(os.environ.get("STATE_FILE", ".state/cooldown.json"))
 
-ONLY_SENDERS = {s for s in os.environ.get("ONLY_SENDERS", "").split(",") if s.strip()}
-SKIP_SENDERS = {s for s in os.environ.get("SKIP_SENDERS", "").split(",") if s.strip()}
-
-# 协作机器人（ops-qa-bot）的 open_id：来自它的 sender_id 时，跳过 TEST_ENV 分类，
-# 走 agent_collab.handle_doc_qa 处理结构化协作请求。多个用逗号分隔。
+# 受信任的 peer agent open_id（逗号分隔）。只有来自这里的发件人才被路由到
+# agent_collab，其它一律忽略——既是安全门，也是噪音过滤。
 COLLAB_SENDERS = {
     s for s in os.environ.get("COLLAB_SENDERS", "").split(",") if s.strip()
 }
-
-REDIRECT_TEMPLATE = (
-    "嗨～测试环境相关的问题，麻烦移步「{group_name}」群里 @{group_bot_name} 直接问哈，"
-    "那边有机器人秒回，也比我私聊查得准。\n\n"
-    "（这条是我设置的自动回复，私聊这类问题就先不一一回了 🙏）"
-)
-
-SYSTEM_PROMPT = """你是一个 DM 分流助手。判断收到的私聊消息是否属于"测试环境维护/支持"类问题。
-
-属于 TEST_ENV 的典型例子：
-- 测试环境登不上 / 报错 / 502 / 503 / 数据库连不上 / 接口挂了
-- 怎么申请测试环境账号 / 部署 / 域名 / 配置 / 权限
-- 某个测试服务挂了 / 重启 / 跑不动 / 数据异常
-- 测试数据怎么造 / mock 接口怎么用 / sandbox 怎么开
-
-属于 OTHER 的：
-- 私事、闲聊、约饭
-- 工作但不涉及测试环境（代码 review、产品讨论、需求对齐、问候）
-- 暧昧/不明确的，一律 OTHER（宁可漏一个，不要误判朋友的私聊）
-
-严格输出单行 JSON，不要 markdown，不要解释：
-{"class": "TEST_ENV" | "OTHER", "reason": "一句话"}
-"""
 
 
 def log(event: str, **fields: object) -> None:
     rec = {"ts": int(time.time()), "event": event, **fields}
     print(json.dumps(rec, ensure_ascii=False), flush=True)
-
-
-# --- cooldown persistence ----------------------------------------------------
-
-def load_state() -> dict[str, float]:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def save_state(state: dict[str, float]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False))
-
-
-_state: dict[str, float] = load_state()
-
-
-def in_cooldown(sender_id: str) -> bool:
-    last = _state.get(sender_id)
-    return bool(last) and (time.time() - last) < COOLDOWN_HOURS * 3600
-
-
-def mark_replied(sender_id: str) -> None:
-    _state[sender_id] = time.time()
-    save_state(_state)
 
 
 # --- event parsing -----------------------------------------------------------
@@ -151,59 +87,11 @@ def extract_message(evt_line: str) -> dict | None:
     }
 
 
-# --- classification ----------------------------------------------------------
-
-async def classify(text: str) -> dict:
-    # 不指定 model：部署机的 Claude Code 已绑定固定的第三方模型，让 SDK
-    # 按它的配置走即可。本仓库内任何地方都不做 per-scenario model 选择。
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
-        allowed_tools=[],
-        max_turns=1,
-    )
-    out = ""
-    async for msg in query(prompt=f"DM 内容：\n{text}", options=options):
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    out += block.text
-    try:
-        return json.loads(out.strip())
-    except Exception:
-        return {"class": "OTHER", "reason": f"parse_fail: {out[:120]!r}"}
-
-
-# --- send reply --------------------------------------------------------------
-
-async def send_redirect(chat_id: str) -> None:
-    text = REDIRECT_TEMPLATE.format(
-        group_name=GROUP_NAME,
-        group_bot_name=GROUP_BOT_NAME,
-    )
-    cmd = [
-        LARK_CLI, "im", "+messages-send",
-        "--as", "user",
-        "--chat-id", chat_id,
-        "--text", text,
-    ]
-    if DRY_RUN:
-        log("dry_run_send", chat_id=chat_id, cmd=" ".join(shlex.quote(c) for c in cmd))
-        return
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        log("send_failed", chat_id=chat_id, rc=proc.returncode, stderr=stderr.decode()[:400])
-    else:
-        log("send_ok", chat_id=chat_id)
-
-
 # --- main loop ---------------------------------------------------------------
 
 async def stream_events() -> AsyncIterator[str]:
-    cmd = [LARK_CLI, "event", "consume", "im.message.receive_v1", "--as", "user"]
-    log("starting", cmd=" ".join(cmd), dry_run=DRY_RUN)
+    cmd = [LARK_CLI, "event", "consume", "im.message.receive_v1", "--as", "bot"]
+    log("starting", cmd=" ".join(cmd))
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
@@ -227,7 +115,7 @@ async def stream_events() -> AsyncIterator[str]:
 
 async def handle(evt: dict) -> None:
     if evt["chat_type"] != "p2p":
-        return  # ignore group chats
+        return  # group chats are out of scope
     if evt["msg_type"] != "text":
         log("skip_non_text", msg_type=evt["msg_type"])
         return
@@ -235,39 +123,17 @@ async def handle(evt: dict) -> None:
     if not sender:
         log("skip_no_sender")
         return
-
-    # 协作机器人短路：跳过 TEST_ENV 分类、白/黑名单、冷却 —— 这条路径只看 sender。
-    # COLLAB_SENDERS 是受信任的 peer agent；它发来的就是结构化 envelope，由
-    # agent_collab 自己 parse、自己处理失败回写，路由层不干涉。
-    if sender in COLLAB_SENDERS:
-        log("collab_in", sender=sender)
-        await agent_collab.handle_doc_qa(evt)
+    if sender not in COLLAB_SENDERS:
+        log("skip_untrusted_sender", sender=sender)
         return
 
-    if ONLY_SENDERS and sender not in ONLY_SENDERS:
-        log("skip_not_in_allowlist", sender=sender)
-        return
-    if sender in SKIP_SENDERS:
-        log("skip_denylist", sender=sender)
-        return
-    if in_cooldown(sender):
-        log("skip_cooldown", sender=sender)
-        return
-
-    text = (evt["text"] or "").strip()
-    if not text:
-        return
-
-    result = await classify(text)
-    log("classified", sender=sender, result=result, preview=text[:80])
-    if result.get("class") != "TEST_ENV":
-        return
-
-    await send_redirect(evt["chat_id"])
-    mark_replied(sender)
+    log("collab_in", sender=sender)
+    await agent_collab.handle_doc_qa(evt)
 
 
 async def main() -> None:
+    if not COLLAB_SENDERS:
+        log("warn_no_collab_senders")
     async for line in stream_events():
         if not line.strip():
             continue
@@ -275,7 +141,6 @@ async def main() -> None:
         if not evt:
             log("parse_fail", raw=line[:200])
             continue
-        # Always log the first few raw events while you verify field shapes
         log("event_in", chat_type=evt["chat_type"], msg_type=evt["msg_type"], sender=evt["sender_id"])
         try:
             await handle(evt)
