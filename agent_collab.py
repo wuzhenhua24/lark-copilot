@@ -22,6 +22,10 @@ Envelope（单行 JSON 文本消息）:
     请求: {"op":"doc_qa","req_id":"<correlation-id>","doc":"<feishu-url>","q":"<question>"}
     回复: {"op":"doc_qa_ack","req_id":"<same>","ok":true,"answer":"..."}
        或 {"op":"doc_qa_ack","req_id":"<same>","ok":false,"error":"..."}
+
+另外暴露一条 `handle_human_doc_qa`：给 HUMAN_SENDERS 白名单里的真人用户用，
+DM 里贴飞书 URL + 自然语言问题就行，答案作为纯文本回。复用同一套
+fetch + Claude QA 管道，错误也用人话回。
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shlex
 import time
 from typing import Any
@@ -276,3 +281,117 @@ async def handle_doc_qa(evt: dict) -> None:
             },
         )
         log("doc_qa_error", req_id=req_id, error=str(ex)[:300])
+
+
+# --- human mode (plain text in, plain text out) -----------------------------
+
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+# 粘 URL 时常见的尾巴标点；URL 里这些字符出现也少见，剔了对 fetch 更友好
+URL_TRAILING_PUNCT = ".,;:)]}>'\"'。，；"
+
+HUMAN_HELP_NO_URL = (
+    "没看到飞书文档链接。把文档 URL 和问题一起发过来就行，比如：\n"
+    "https://xxx.feishu.cn/docx/XXX 这文档怎么处理 OOM"
+)
+HUMAN_HELP_NO_QUESTION = (
+    "贴了文档但没看到问题。再发一次时把问题也带上，比如：\n"
+    "<URL> 这文档怎么处理 OOM"
+)
+
+
+def parse_human_request(text: str) -> tuple[str | None, str | None, str | None]:
+    """把一段自然语言切成 (doc_url, question, error)。
+
+    成功：返回 (url, question, None)。
+    失败：返回 (None, None, 人话错误提示)，让上层直接发回 chat。
+    """
+    if not text or not text.strip():
+        return None, None, "消息是空的，请贴文档链接 + 问题。"
+    m = URL_RE.search(text)
+    if not m:
+        return None, None, HUMAN_HELP_NO_URL
+    doc_url = m.group(0).rstrip(URL_TRAILING_PUNCT)
+    # 把第一个 URL 抠掉（不动后面可能出现的 URL，全部留在 question 里
+    # 让 Claude 自己判断要不要管），剩下的当问题。
+    question = (text[: m.start()] + text[m.end():]).strip()
+    if not question:
+        return None, None, HUMAN_HELP_NO_QUESTION
+    return doc_url, question, None
+
+
+async def send_text_reply(chat_id: str, text: str) -> None:
+    """以 bot 身份发一条纯文本 DM。"""
+    cmd = [
+        LARK_CLI, "im", "+messages-send",
+        "--as", "bot",
+        "--chat-id", chat_id,
+        "--text", text,
+    ]
+    if DRY_RUN:
+        log("dry_run_send_text", chat_id=chat_id, cmd=" ".join(shlex.quote(c) for c in cmd))
+        return
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        log(
+            "send_text_failed",
+            chat_id=chat_id,
+            rc=proc.returncode,
+            stderr=stderr.decode(errors="replace")[:300],
+        )
+    else:
+        log("send_text_ok", chat_id=chat_id)
+
+
+async def handle_human_doc_qa(evt: dict) -> None:
+    """处理真人 DM 的 doc QA 请求。
+
+    输入是自然语言（不是 envelope），输出也是自然语言。其它逻辑与 envelope
+    版本一致：fetch_doc_as_markdown + answer_from_doc，超时按 40/60 切。
+    """
+    text = (evt.get("text") or "").strip()
+    chat_id = evt.get("chat_id")
+    if not chat_id:
+        log("human_doc_qa_no_chat_id")
+        return
+
+    doc_url, question, err = parse_human_request(text)
+    if err:
+        log("human_doc_qa_bad_input", preview=text[:120])
+        await send_text_reply(chat_id, err)
+        return
+
+    log("human_doc_qa_in", doc=doc_url, q_preview=question[:80])
+    started = time.time()
+    try:
+        doc_md = await asyncio.wait_for(
+            fetch_doc_as_markdown(doc_url),
+            timeout=DOC_QA_TIMEOUT_SEC * 0.4,
+        )
+        log("doc_fetched", bytes=len(doc_md))
+        answer = await asyncio.wait_for(
+            answer_from_doc(question, doc_md),
+            timeout=DOC_QA_TIMEOUT_SEC * 0.6,
+        )
+        await send_text_reply(chat_id, answer)
+        log(
+            "human_doc_qa_done",
+            took_ms=int((time.time() - started) * 1000),
+            answer_len=len(answer),
+        )
+    except asyncio.TimeoutError:
+        await send_text_reply(
+            chat_id,
+            "⌛ 超时了：拉文档或推理时间过长（默认 55s）。文档可能太大，或者临时网络抖了一下，可以稍后重试。",
+        )
+        log("human_doc_qa_timeout", took_ms=int((time.time() - started) * 1000))
+    except Exception as ex:  # noqa: BLE001
+        await send_text_reply(
+            chat_id,
+            f"❌ 出错了：{type(ex).__name__}: {str(ex)[:200]}",
+        )
+        log("human_doc_qa_error", error=str(ex)[:300])

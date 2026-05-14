@@ -3,8 +3,10 @@ lark-copilot · dispatcher
 
 薄薄一层 dispatcher：把飞书 IM 事件流分发到具体的 capability handler。
 
-当前只有一个 handler —— `agent_collab.handle_doc_qa`：接收来自受信任 peer agent
-（典型如 ops-qa-bot）的 doc_qa envelope，去飞书拉文档、跑 Claude 答题、再 ack 回去。
+两条路径，按发件人白名单分流：
+- `COLLAB_SENDERS` → `agent_collab.handle_doc_qa`（envelope in / envelope out）
+- `HUMAN_SENDERS`  → `agent_collab.handle_human_doc_qa`（自然语言 in / 纯文本 out）
+- 不在任一白名单的发件人一律丢，作为安全门 + 噪音过滤
 
 身份与限制：
 - `im.message.receive_v1` 事件在飞书 Open Platform 是**应用级**的，只支持 `--as bot`
@@ -31,10 +33,18 @@ load_dotenv()
 
 LARK_CLI = os.environ.get("LARK_CLI", "lark-cli")
 
-# 受信任的 peer agent open_id（逗号分隔）。只有来自这里的发件人才被路由到
-# agent_collab，其它一律忽略——既是安全门，也是噪音过滤。
+# 受信任的 peer agent open_id（逗号分隔）。这些发件人发的是结构化 envelope，
+# 走 agent_collab.handle_doc_qa（envelope in/out）。
 COLLAB_SENDERS = {
     s for s in os.environ.get("COLLAB_SENDERS", "").split(",") if s.strip()
+}
+
+# 真人用户 open_id 白名单（逗号分隔）。这些发件人发自然语言（飞书 URL +
+# 问题），走 agent_collab.handle_human_doc_qa（plain text in/out）。
+# 不在 COLLAB_SENDERS / HUMAN_SENDERS 任一名单里的发件人一律丢，既是安全门
+# 也是噪音过滤。
+HUMAN_SENDERS = {
+    s for s in os.environ.get("HUMAN_SENDERS", "").split(",") if s.strip()
 }
 
 
@@ -123,17 +133,21 @@ async def handle(evt: dict) -> None:
     if not sender:
         log("skip_no_sender")
         return
-    if sender not in COLLAB_SENDERS:
-        log("skip_untrusted_sender", sender=sender)
+    if sender in COLLAB_SENDERS:
+        log("collab_in", sender=sender)
+        await agent_collab.handle_doc_qa(evt)
+        return
+    if sender in HUMAN_SENDERS:
+        log("human_in", sender=sender)
+        await agent_collab.handle_human_doc_qa(evt)
         return
 
-    log("collab_in", sender=sender)
-    await agent_collab.handle_doc_qa(evt)
+    log("skip_untrusted_sender", sender=sender)
 
 
 async def main() -> None:
-    if not COLLAB_SENDERS:
-        log("warn_no_collab_senders")
+    if not COLLAB_SENDERS and not HUMAN_SENDERS:
+        log("warn_no_senders_configured")
     async for line in stream_events():
         if not line.strip():
             continue

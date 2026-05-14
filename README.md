@@ -1,7 +1,9 @@
 # lark-copilot
 
-为内网部署的 [ops-qa-bot](../ops-qa-bot) 提供"飞书外设"能力的 **doc QA worker**：接收
-peer agent 发来的结构化 envelope，去飞书拉指定文档、跑 Claude 答题、把答案 ack 回去。
+飞书侧的 **doc QA worker**。两条路径走同一套"拉飞书文档 + Claude 单轮 QA"管道：
+
+- **Agent 模式**：内网部署的 [ops-qa-bot](../ops-qa-bot) 发结构化 envelope 过来，回 envelope ack
+- **Human 模式**：白名单里的真人 DM 一段"飞书 URL + 问题"，回纯文本答案
 
 基于 [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) +
 [lark-cli](https://github.com/larksuite/lark-cli) 搭建。
@@ -151,9 +153,10 @@ uv sync
 
 | 字段 | 含义 |
 |---|---|
-| `COLLAB_SENDERS` | 受信任的 peer open_id（ops-qa-bot 的 bot open_id），逗号分隔可多个 |
+| `COLLAB_SENDERS` | 受信任的 peer agent open_id（如 ops-qa-bot 的 bot open_id），逗号分隔可多个 |
+| `HUMAN_SENDERS` | 允许直接 DM 提问的真人 open_id，逗号分隔可多个 |
 | `DOC_QA_TIMEOUT_SEC` | 一次 doc_qa 的总超时（拉文档 + 推理），默认 55s |
-| `DRY_RUN` | `1` 只 log 不真发 ack；`0` 真发。**首次跑保持 1。** |
+| `DRY_RUN` | `1` 只 log 不真发回复；`0` 真发。**首次跑保持 1。** |
 | `LARK_CLI` | lark-cli 可执行路径，默认 `lark-cli` |
 
 跑起来：
@@ -167,13 +170,28 @@ uv run python router.py
 | event | 含义 |
 |---|---|
 | `starting` | 启动，附 lark-cli 命令 |
-| `warn_no_collab_senders` | `COLLAB_SENDERS` 未配，所有 DM 都会被丢 |
+| `warn_no_senders_configured` | `COLLAB_SENDERS` 和 `HUMAN_SENDERS` 都为空，所有 DM 都会被丢 |
 | `event_in` | 收到一条事件 |
-| `skip_untrusted_sender` | 发件人不在 COLLAB_SENDERS 白名单 |
-| `collab_in` | 命中白名单，转给 agent_collab |
-| `doc_qa_in` / `doc_fetched` / `doc_qa_done` | 协作流程的三个 checkpoint |
-| `dry_run_send_ack` | DRY_RUN 下要发的 ack 命令（实际没发） |
-| `send_ack_ok` / `send_ack_failed` | 真实回送结果 |
+| `skip_untrusted_sender` | 发件人不在任一白名单 —— 想加入 Human 模式，把这一行的 `sender` 复制到 `HUMAN_SENDERS` |
+| `collab_in` / `human_in` | 命中对应白名单 |
+| `doc_qa_in` / `doc_fetched` / `doc_qa_done` | envelope 路径的 checkpoint |
+| `human_doc_qa_in` / `human_doc_qa_done` / `human_doc_qa_bad_input` | human 路径的 checkpoint |
+| `dry_run_send_ack` / `dry_run_send_text` | DRY_RUN 下要发的命令（实际没发） |
+| `send_ack_ok` / `send_text_ok` / `*_failed` | 真实回送结果 |
+
+### Human 模式怎么用
+
+1. 部署机起 router 后，从你**真人**飞书账号 DM 一下 lark-copilot bot（随便发一条）
+2. 在 router 日志里找 `skip_untrusted_sender`，复制 `sender` 字段（形如 `ou_xxxx`）
+3. 把它填到 `.env` 的 `HUMAN_SENDERS`，重启 router
+4. 再 DM bot 一条这样的消息：
+
+   ```
+   https://xxx.feishu.cn/docx/XXXXXXX 这文档怎么处理 OOM 流程？
+   ```
+
+   bot 会拉文档、跑 QA、把答案纯文本回给你。第一个飞书 URL 当 doc，剩下文本当问题。
+   缺 URL 或缺问题会用人话提示。
 
 ---
 
@@ -185,7 +203,7 @@ lark-copilot/
 ├── pyproject.toml     依赖声明（uv 管理）
 ├── .env.example       配置模板
 ├── router.py          薄 dispatcher：event consume → 按 sender 白名单 → agent_collab
-└── agent_collab.py    doc QA 主体：fetch 文档 + Claude QA + ack envelope
+└── agent_collab.py    doc QA 主体：fetch 文档 + Claude QA + 回 ack envelope / 纯文本
 ```
 
 ---
@@ -214,7 +232,7 @@ lark-copilot/
 | `--as user is not supported` | 又把 `--as user` 用到了 event consume 上了，这事件只支持 bot |
 | `send_ack_failed` 报权限 | bot 缺 `im:message:send` 应用身份 scope |
 | `lark-cli docs +fetch` 失败 | (a) user 没登录 / 没勾 `docx:document:readonly`（用户身份） (b) 登录 user 对该文档没查看权限——让用户先把文档分享给你 |
-| `warn_no_collab_senders` | `.env` 里 `COLLAB_SENDERS` 没填，所有发件人都会被 `skip_untrusted_sender` 丢 |
+| `warn_no_senders_configured` | `.env` 里 `COLLAB_SENDERS` 和 `HUMAN_SENDERS` 都没填，所有发件人都会被 `skip_untrusted_sender` 丢 |
 | A 调工具后超时 | (a) B 没起 / (b) DRY_RUN=1（B 不会真回） / (c) `COLLAB_SENDERS` 没含 A 的 bot open_id |
 | 答案过长被截 | B 自动按 ~28KB 字节裁 `answer` 字段并打 `truncated:true`；要完整内容打开原文档 |
 | 同一份文档反复被拉 | 本期没做缓存。高频场景可在 B 侧加 docx_token → markdown 的本地 TTL 缓存 |
