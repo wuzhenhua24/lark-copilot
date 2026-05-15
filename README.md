@@ -155,8 +155,10 @@ uv sync
 |---|---|
 | `COLLAB_SENDERS` | 受信任的 peer agent open_id（如 ops-qa-bot 的 bot open_id），逗号分隔可多个 |
 | `HUMAN_SENDERS` | 允许直接 DM 提问的真人 open_id，逗号分隔可多个 |
-| `DOC_QA_TIMEOUT_SEC` | 一次 doc_qa 的总超时（拉文档 + 推理），默认 55s |
+| `DOC_FETCH_TIMEOUT_SEC` | 拉文档（lark-cli docs +fetch）的硬超时，默认 30s |
+| `INFERENCE_TIMEOUT_SEC` | 单轮模型推理的硬超时，含 fetch_doc_image 工具 round-trip，默认 120s |
 | `SESSION_TTL_MIN` | Human 模式会话空闲多少分钟后被回收，默认 30 |
+| `MAX_IMAGES_PER_QUESTION` | 单次问题里 Claude 最多通过 fetch_doc_image 工具拉几张图，默认 3 |
 | `DRY_RUN` | `1` 只 log 不真发回复；`0` 真发。**首次跑保持 1。** |
 | `LARK_CLI` | lark-cli 可执行路径，默认 `lark-cli` |
 

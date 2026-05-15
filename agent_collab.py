@@ -56,7 +56,12 @@ from claude_agent_sdk import (
 )
 
 LARK_CLI = os.environ.get("LARK_CLI", "lark-cli")
-DOC_QA_TIMEOUT_SEC = float(os.environ.get("DOC_QA_TIMEOUT_SEC", "55"))
+# 拉文档（lark-cli docs +fetch 一次或多次）的硬超时。fetch 通常 1-3 秒，
+# 留 30 秒已经很宽裕，主要兜底网络抖动。
+DOC_FETCH_TIMEOUT_SEC = float(os.environ.get("DOC_FETCH_TIMEOUT_SEC", "30"))
+# 单轮模型推理的硬超时，含 tool round-trip（fetch_doc_image 拉图 + 模型看图再答）。
+# 多图问题 + vision token 容易跑十几秒，默认给 120 秒，按需上调。
+INFERENCE_TIMEOUT_SEC = float(os.environ.get("INFERENCE_TIMEOUT_SEC", "120"))
 DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
 
 # 飞书文本 DM 上限约 30 KB。留 ~2 KB 给 envelope 外壳和 UTF-8 多字节膨胀，
@@ -382,14 +387,14 @@ async def handle_doc_qa(evt: dict) -> None:
     started = time.time()
     try:
         doc_md, _imgs = await asyncio.wait_for(
-            fetch_doc_as_markdown(doc), timeout=DOC_QA_TIMEOUT_SEC * 0.4
+            fetch_doc_as_markdown(doc), timeout=DOC_FETCH_TIMEOUT_SEC
         )
         # 单轮 envelope 路径暂不支持图，丢掉 _imgs；markdown 里的 `![](...)` 占位
         # 让模型自己判断（看不到图时它会说"图里没看到"）。
         log("doc_fetched", req_id=req_id, bytes=len(doc_md), imgs=len(_imgs))
         answer = await asyncio.wait_for(
             answer_from_doc(question, doc_md),
-            timeout=DOC_QA_TIMEOUT_SEC * 0.6,
+            timeout=INFERENCE_TIMEOUT_SEC,
         )
         await send_envelope_reply(
             chat_id,
@@ -750,7 +755,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
                 try:
                     md, imgs = await asyncio.wait_for(
                         fetch_doc_as_markdown(url),
-                        timeout=DOC_QA_TIMEOUT_SEC * 0.4,
+                        timeout=DOC_FETCH_TIMEOUT_SEC,
                     )
                 except asyncio.TimeoutError:
                     await send_text_reply(chat_id, f"⌛ 拉文档超时：{url}")
@@ -828,7 +833,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
         try:
             answer = await asyncio.wait_for(
                 _run_client_turn(client, user_msg),
-                timeout=DOC_QA_TIMEOUT_SEC * 0.6,
+                timeout=INFERENCE_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
             await send_text_reply(
