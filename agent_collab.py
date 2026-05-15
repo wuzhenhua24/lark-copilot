@@ -19,7 +19,7 @@ lark-copilot · agent_collab
 - 鉴权天然：发件人 open_id 就是身份，router 按 sender 白名单过滤
 
 Envelope（单行 JSON 文本消息）:
-    请求: {"op":"doc_qa","req_id":"<correlation-id>","doc":"<feishu-url>","q":"<question>"}
+    请求: {"op":"doc_qa","req_id":"<correlation-id>","docs":["<feishu-url>", ...],"q":"<question>"}
     回复: {"op":"doc_qa_ack","req_id":"<same>","ok":true,"answer":"..."}
        或 {"op":"doc_qa_ack","req_id":"<same>","ok":false,"error":"..."}
 
@@ -71,13 +71,14 @@ DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
 MAX_ACK_BYTES = 28000
 TRUNCATE_SUFFIX = "\n\n…（答案过长，已截断；建议直接打开原文档查阅完整内容）"
 
-DOC_QA_SYSTEM_PROMPT = """你是文档问答助手。下面会给你一段飞书文档的 Markdown 全文和一个问题。
+DOC_QA_SYSTEM_PROMPT = """你是文档问答助手。下面会给你一篇或多篇飞书文档的 Markdown 全文和一个问题。
 
 规则：
 - 只基于提供的文档回答；文档里没有的信息直接说"文档里没找到"，不要凭常识补
 - 答得简洁，3-5 句话覆盖核心；需要步骤就用编号列表
 - 如果问题跟文档明显无关，直接说明并停止
 - 不要把整段文档抄回来当作答案
+- 同时引用多篇文档时，注明引用了哪一篇（用 url 或简短的来源标识）
 """
 
 
@@ -103,7 +104,14 @@ def parse_envelope(text: str) -> dict | None:
         return None
     if not isinstance(obj.get("req_id"), str):
         return None
-    if not isinstance(obj.get("doc"), str) or not isinstance(obj.get("q"), str):
+    docs = obj.get("docs")
+    if (
+        not isinstance(docs, list)
+        or not docs
+        or not all(isinstance(d, str) and d for d in docs)
+    ):
+        return None
+    if not isinstance(obj.get("q"), str):
         return None
     return obj
 
@@ -264,8 +272,11 @@ async def download_doc_image(token: str) -> tuple[bytes, str]:
 
 # --- doc QA via Claude -------------------------------------------------------
 
-async def answer_from_doc(question: str, doc_md: str) -> str:
-    """把 Markdown 全文塞进 user message 让 Claude 答。
+async def answer_from_doc(question: str, docs: list[tuple[str, str]]) -> str:
+    """把若干篇 (url, markdown) 拼进 user message 让 Claude 答。
+
+    每篇文档包成 `<document url="...">...</document>`，让模型可以在跨文档作答时
+    用 url 注明引用来源（system prompt 里有规则）。
 
     单轮 query：不开任何工具（避免 agent 跑去执行别的，doc 已经在 prompt 里了）。
     不指定 model：部署机的 Claude Code 已绑定固定第三方模型，SDK 按它的配置走。
@@ -275,10 +286,9 @@ async def answer_from_doc(question: str, doc_md: str) -> str:
         allowed_tools=[],
         max_turns=1,
     )
-    user_msg = (
-        f"<document>\n{doc_md}\n</document>\n\n"
-        f"<question>\n{question}\n</question>"
-    )
+    parts = [f'<document url="{url}">\n{md}\n</document>' for url, md in docs]
+    parts.append(f"<question>\n{question}\n</question>")
+    user_msg = "\n\n".join(parts)
     out_parts: list[str] = []
     async for msg in query(prompt=user_msg, options=options):
         if isinstance(msg, AssistantMessage):
@@ -375,10 +385,10 @@ async def handle_doc_qa(evt: dict) -> None:
         log("doc_qa_bad_envelope", sender=evt.get("sender_id"), preview=text[:120])
         return
     req_id = env["req_id"]
-    doc = env["doc"]
+    docs = env["docs"]
     question = env["q"]
     chat_id = evt.get("chat_id")
-    log("doc_qa_in", req_id=req_id, doc=doc, q_preview=question[:80])
+    log("doc_qa_in", req_id=req_id, docs=docs, doc_count=len(docs), q_preview=question[:80])
 
     if not chat_id:
         log("doc_qa_no_chat_id", req_id=req_id)
@@ -386,14 +396,22 @@ async def handle_doc_qa(evt: dict) -> None:
 
     started = time.time()
     try:
-        doc_md, _imgs = await asyncio.wait_for(
-            fetch_doc_as_markdown(doc), timeout=DOC_FETCH_TIMEOUT_SEC
+        # 并发拉所有文档；DOC_FETCH_TIMEOUT_SEC 给整体兜底（每篇内部已并行拉
+        # markdown+xml，外层 gather 再让多篇彼此并行）。单轮 envelope 路径暂不
+        # 支持图，丢掉 _imgs；markdown 里的 `![](...)` 占位让模型自己判断。
+        fetched = await asyncio.wait_for(
+            asyncio.gather(*(fetch_doc_as_markdown(u) for u in docs)),
+            timeout=DOC_FETCH_TIMEOUT_SEC,
         )
-        # 单轮 envelope 路径暂不支持图，丢掉 _imgs；markdown 里的 `![](...)` 占位
-        # 让模型自己判断（看不到图时它会说"图里没看到"）。
-        log("doc_fetched", req_id=req_id, bytes=len(doc_md), imgs=len(_imgs))
+        doc_pairs: list[tuple[str, str]] = [(u, md) for u, (md, _imgs) in zip(docs, fetched)]
+        log(
+            "doc_fetched",
+            req_id=req_id,
+            doc_count=len(doc_pairs),
+            total_bytes=sum(len(md) for _, md in doc_pairs),
+        )
         answer = await asyncio.wait_for(
-            answer_from_doc(question, doc_md),
+            answer_from_doc(question, doc_pairs),
             timeout=INFERENCE_TIMEOUT_SEC,
         )
         await send_envelope_reply(
@@ -481,6 +499,19 @@ def extract_urls(text: str) -> list[str]:
 def strip_urls(text: str) -> str:
     """把所有 URL 从文本里抠掉，留剩余文字。"""
     return URL_RE.sub("", text or "").strip()
+
+
+def _default_summary_question(urls: list[str]) -> str:
+    """用户只贴 URL 没附问题时，合成一个默认的"总结"提问。
+
+    单篇 → 短小要点列表；多篇 → 综合摘要并标注来源，避免模型把多篇糊在一起。
+    """
+    if len(urls) <= 1:
+        return "请总结这篇文档的核心要点，用 3-5 条要点呈现。"
+    return (
+        "请综合这些文档，提炼核心要点；每条要点标注来自哪一篇（用 url 或简短"
+        "来源标识），用编号列表呈现。"
+    )
 
 
 # --- per-chat session state --------------------------------------------------
@@ -793,15 +824,16 @@ async def handle_human_doc_qa(evt: dict) -> None:
                 )
             sess.touch()
 
-        # 只加载文档没问题 → 确认即停（不浪费一轮 Claude 推理）
+        # 没问题但带了 URL → 默认走总结：合成 summary question 继续往下推理。
+        # （没问题也没 URL 的空消息上面早就返回过了，这里 urls 一定非空。）
         if not question:
-            listing = "\n".join(f"- {u}" for u in new_urls)
-            await send_text_reply(
-                chat_id,
-                f"📄 已加载 {len(new_urls)} 篇文档：\n{listing}\n\n继续把问题发过来即可。",
+            question = _default_summary_question(urls)
+            log(
+                "human_doc_qa_default_summary",
+                chat_id=chat_id,
+                doc_count=len(urls),
+                new_docs=len(new_urls),
             )
-            log("human_doc_qa_docs_loaded", chat_id=chat_id, loaded=len(new_urls), total=len(sess.doc_cache))
-            return
 
         # 有问题 → 跑 Claude。spawn 时按当前是否已有文档挑 prompt：
         # 已有文档（包括本轮刚拉的）→ 走严格 doc QA；纯闲聊 → 轻量 chitchat。

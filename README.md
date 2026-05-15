@@ -53,7 +53,7 @@ A (ops-qa-bot, 内网)   ┌─────────────────�
                        │ → DM lark-copilot bot 一条 envelope  │
                        └──────────────┬──────────────────────┘
                                       │  飞书 IM (text, JSON envelope)
-                                      │  {"op":"doc_qa","req_id":"...","doc":"...","q":"..."}
+                                      │  {"op":"doc_qa","req_id":"...","docs":["...", ...],"q":"..."}
                                       ▼
 B (lark-copilot,   ┌──────────────────────────────────────────────┐
    有飞书出口)     │ router.py (--as bot 接事件)                   │
@@ -75,7 +75,7 @@ A: rpc.try_deliver 命中 req_id → 唤醒 await 的 Future → tool 返回 ans
 请求（A → B）：
 
 ```json
-{"op":"doc_qa","req_id":"<uuid12>","doc":"<feishu-url>","q":"<question>"}
+{"op":"doc_qa","req_id":"<uuid12>","docs":["<feishu-url>", "..."],"q":"<question>"}
 ```
 
 成功回复：
@@ -180,7 +180,7 @@ uv run python router.py
 | `doc_qa_in` / `doc_fetched` / `doc_qa_done` | envelope 路径的 checkpoint |
 | `session_created` / `session_evict_idle` / `session_client_spawned` | Human 模式 per-chat 会话生命周期 |
 | `human_doc_qa_in` / `human_doc_qa_done` | human 路径单轮 checkpoint |
-| `human_doc_qa_fetch` / `human_doc_qa_docs_loaded` / `human_doc_qa_no_doc_followup` | 文档加载 / 单纯加载 / 没文档却追问 |
+| `human_doc_qa_fetch` / `human_doc_qa_default_summary` | 文档加载 / 裸 URL 触发默认总结 |
 | `human_doc_qa_reset` | 用户触发了 /reset |
 | `dry_run_send_ack` / `dry_run_send_text` | DRY_RUN 下要发的命令（实际没发） |
 | `send_ack_ok` / `send_text_ok` / `*_failed` | 真实回送结果 |
