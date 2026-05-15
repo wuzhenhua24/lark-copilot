@@ -104,15 +104,21 @@ def parse_envelope(text: str) -> dict | None:
 async def fetch_doc_as_markdown(doc_url_or_token: str) -> str:
     """调 lark-cli 把飞书文档导出成 Markdown。
 
-    lark-cli docs +fetch --api-version v2 支持文档 URL 或 token；--format markdown
-    要求底层文档为 docx 类型（飞书新版文档）。失败时抛 RuntimeError，由上层翻译成
-    error envelope 返回给 A。
+    lark-cli flag schema：
+    - --doc <url|token>     文档 URL 或 token（必须 flag 形式，不接受位置参数）
+    - --doc-format markdown 文档内容格式（v2 才有，控制实际文档内容；不要跟 --format 混了）
+    - --format json         CLI 输出包装层格式，默认就是 json
+    - --as user             docx 读权限挂在 user OAuth 上，bot 身份没权限
+
+    v2 输出是 JSON 信封：`.data.document.content` 才是 markdown 正文。
+    失败抛 RuntimeError，由上层翻译成 error envelope。
     """
     cmd = [
         LARK_CLI, "docs", "+fetch",
         "--api-version", "v2",
-        "--format", "markdown",
-        doc_url_or_token,
+        "--doc", doc_url_or_token,
+        "--doc-format", "markdown",
+        "--as", "user",
     ]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -125,7 +131,15 @@ async def fetch_doc_as_markdown(doc_url_or_token: str) -> str:
             f"lark-cli docs +fetch rc={proc.returncode}: "
             f"{stderr.decode(errors='replace')[:300]}"
         )
-    return stdout.decode(errors="replace")
+    try:
+        payload = json.loads(stdout.decode(errors="replace"))
+        content = payload["data"]["document"]["content"]
+    except (json.JSONDecodeError, KeyError, TypeError) as ex:
+        raise RuntimeError(
+            f"lark-cli docs +fetch 返回结构异常：{type(ex).__name__}: "
+            f"{stdout.decode(errors='replace')[:200]}"
+        ) from ex
+    return content
 
 
 # --- doc QA via Claude -------------------------------------------------------
