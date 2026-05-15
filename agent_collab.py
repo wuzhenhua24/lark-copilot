@@ -40,7 +40,7 @@ import os
 import re
 import shlex
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from claude_agent_sdk import (
@@ -310,6 +310,16 @@ HUMAN_SYSTEM_PROMPT = """你是飞书文档问答助手。用户会陆续给你�
 - 同时引用多篇文档时，注明引用了哪一篇（用 url 或简短的来源标识）
 """
 
+# 新会话还没收到任何文档时用这个；轻量友好，鼓励但不强求贴文档。
+# 一旦后续真有 <document> 进对话历史，模型也能自然切换到基于文档作答。
+CHITCHAT_SYSTEM_PROMPT = """你是一个轻量的飞书机器人助手。主业是飞书文档问答，但用户也可以随便聊两句。
+
+规则：
+- 没有 <document> 块时：友好、简短地回应即可。合适时可以提一句"也可以贴飞书文档链接让我读后再问"，但别每条都说
+- 出现 <document url="..."> 块后：切到严格文档问答——只基于文档作答，文档没提的直接说"文档里没找到"
+- 答得简洁，避免长篇大论
+"""
+
 
 def extract_urls(text: str) -> list[str]:
     """从文本里抠出所有 URL，剔掉常见尾巴标点，保持原顺序、去重。"""
@@ -391,10 +401,19 @@ class SessionManager:
             log("session_created", chat_id=chat_id)
         return sess
 
-    async def ensure_client(self, sess: ChatSession) -> ClaudeSDKClient:
-        """第一次真要 query 时再 spawn Claude Code 子进程。"""
+    async def ensure_client(
+        self, sess: ChatSession, system_prompt: str | None = None,
+    ) -> ClaudeSDKClient:
+        """第一次真要 query 时再 spawn Claude Code 子进程。
+
+        system_prompt 为 None 时用 SessionManager 自带的默认 options；传值则覆盖
+        system_prompt 字段。只在 spawn 那一刻生效，已有 client 的 session 不会重建。
+        """
         if sess.client is None:
-            client = ClaudeSDKClient(options=self._options)
+            opts = self._options
+            if system_prompt is not None and system_prompt != opts.system_prompt:
+                opts = replace(opts, system_prompt=system_prompt)
+            client = ClaudeSDKClient(options=opts)
             await client.connect()
             sess.client = client
             log("session_client_spawned", chat_id=sess.chat_id)
@@ -517,14 +536,6 @@ async def handle_human_doc_qa(evt: dict) -> None:
             await send_text_reply(chat_id, "消息是空的。请把问题（和文档链接）发过来。")
             return
 
-        if not sess.doc_cache and not new_urls and question:
-            await send_text_reply(
-                chat_id,
-                "这是新对话，还没加载任何文档。请把飞书文档链接和问题一起发过来。",
-            )
-            log("human_doc_qa_no_doc_followup", chat_id=chat_id)
-            return
-
         # 拉新文档
         if new_urls:
             log("human_doc_qa_fetch", chat_id=chat_id, count=len(new_urls))
@@ -558,9 +569,12 @@ async def handle_human_doc_qa(evt: dict) -> None:
             log("human_doc_qa_docs_loaded", chat_id=chat_id, loaded=len(new_urls), total=len(sess.doc_cache))
             return
 
-        # 有问题 → 跑 Claude
+        # 有问题 → 跑 Claude。spawn 时按当前是否已有文档挑 prompt：
+        # 已有文档（包括本轮刚拉的）→ 走严格 doc QA；纯闲聊 → 轻量 chitchat。
+        # 已 spawn 的 client 不会换 prompt，但两个 prompt 都能 handle 后续 <document>。
+        spawn_prompt = HUMAN_SYSTEM_PROMPT if sess.doc_cache else CHITCHAT_SYSTEM_PROMPT
         try:
-            client = await mgr.ensure_client(sess)
+            client = await mgr.ensure_client(sess, system_prompt=spawn_prompt)
         except Exception as ex:  # noqa: BLE001
             await send_text_reply(
                 chat_id,
@@ -571,11 +585,15 @@ async def handle_human_doc_qa(evt: dict) -> None:
 
         # 这次需要补发哪些文档到对话历史里
         to_inject = [u for u in sess.doc_cache if u not in sess.docs_in_client_context]
-        parts: list[str] = []
-        for url in to_inject:
-            parts.append(f'<document url="{url}">\n{sess.doc_cache[url]}\n</document>')
-        parts.append(f"<question>\n{question}\n</question>")
-        user_msg = "\n\n".join(parts)
+        if sess.doc_cache:
+            parts: list[str] = []
+            for url in to_inject:
+                parts.append(f'<document url="{url}">\n{sess.doc_cache[url]}\n</document>')
+            parts.append(f"<question>\n{question}\n</question>")
+            user_msg = "\n\n".join(parts)
+        else:
+            # 闲聊模式：没文档可注入，直接送原文，避免 <question> 包裹让模型误判语境
+            user_msg = question
 
         log(
             "human_doc_qa_in",
@@ -583,6 +601,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
             q_preview=question[:80],
             inject_docs=len(to_inject),
             total_docs=len(sess.doc_cache),
+            mode="doc_qa" if sess.doc_cache else "chitchat",
         )
         started = time.time()
         try:
