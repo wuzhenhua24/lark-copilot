@@ -28,7 +28,11 @@ from collections.abc import AsyncIterator
 
 from dotenv import load_dotenv
 
-import agent_collab
+# 必须先 load_dotenv 再 import agent_collab：agent_collab 模块级就会读 DRY_RUN 等
+# 环境变量并锁定全局常量，import 时机比 load_dotenv 早就只能拿到默认值。
+load_dotenv()
+
+import agent_collab  # noqa: E402  — 故意放在 load_dotenv 之后
 
 # Windows 控制台默认 cp936/cp1252，NDJSON 里的中文会乱码 / Mac & Linux 默认就是 UTF-8。
 # 入口处把 stdout/stderr 强制成 UTF-8，跨平台行为一致。Python 3.7+ 的 TextIOWrapper
@@ -38,8 +42,6 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8")
     except (AttributeError, ValueError):
         pass
-
-load_dotenv()
 
 LARK_CLI = os.environ.get("LARK_CLI", "lark-cli")
 
@@ -80,10 +82,14 @@ def extract_message(evt_line: str) -> dict | None:
     msg = inner.get("message") or {}
     sender = inner.get("sender") or {}
 
+    # lark-cli 给的是扁平 projection：sender_id 直接是顶层字符串。
+    # 飞书原始事件 envelope 则把它放在 sender.sender_id.open_id。两种都兜底。
+    flat_sender = inner.get("sender_id")
     sender_id = (
         (sender.get("sender_id") or {}).get("open_id")
         or sender.get("open_id")
         or sender.get("user_id")
+        or (flat_sender if isinstance(flat_sender, str) else None)
     )
     chat_type = msg.get("chat_type") or inner.get("chat_type")
     chat_id = msg.get("chat_id") or inner.get("chat_id")
