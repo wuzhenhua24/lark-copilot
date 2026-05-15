@@ -35,10 +35,12 @@ DM 里贴飞书 URL + 自然语言问题就行，答案作为纯文本回。**�
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
 import shlex
+import tempfile
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -48,7 +50,9 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     TextBlock,
+    create_sdk_mcp_server,
     query,
+    tool,
 )
 
 LARK_CLI = os.environ.get("LARK_CLI", "lark-cli")
@@ -101,23 +105,33 @@ def parse_envelope(text: str) -> dict | None:
 
 # --- doc fetch via lark-cli --------------------------------------------------
 
-async def fetch_doc_as_markdown(doc_url_or_token: str) -> str:
-    """调 lark-cli 把飞书文档导出成 Markdown。
+@dataclass
+class ImageRef:
+    """文档里一张图的元信息，由 XML fetch 时抠出来，用于按需 media-download。"""
+    token: str       # lark-cli docs +media-download 用的 file_token (XML <img src="...">)
+    name: str        # 原文件名，如 image.png
+    mime: str        # image/png 之类
+    width: int
+    height: int
 
-    lark-cli flag schema：
-    - --doc <url|token>     文档 URL 或 token（必须 flag 形式，不接受位置参数）
-    - --doc-format markdown 文档内容格式（v2 才有，控制实际文档内容；不要跟 --format 混了）
-    - --format json         CLI 输出包装层格式，默认就是 json
-    - --as user             docx 读权限挂在 user OAuth 上，bot 身份没权限
 
-    v2 输出是 JSON 信封：`.data.document.content` 才是 markdown 正文。
-    失败抛 RuntimeError，由上层翻译成 error envelope。
-    """
+# XML 里 <img src="..." name="..." mime="..." width="..." height="..."/> 的属性抽取。
+# 用宽松的 r'<img\s[^>]*/>' 加 attr 拾取，避免上 ElementTree（XML 整体有不闭合的可能）。
+_IMG_TAG_RE = re.compile(r'<img\s[^>]*/>')
+_IMG_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+
+# Markdown 里飞书生成的图片始终是 `![](URL)` 形式（alt 文本为空）。
+_MD_IMG_RE = re.compile(r'!\[[^\]]*\]\([^)]*\)')
+
+
+async def _fetch_doc_content(doc_url_or_token: str, doc_format: str) -> str:
+    """单次 lark-cli docs +fetch；返回 .data.document.content。"""
     cmd = [
         LARK_CLI, "docs", "+fetch",
         "--api-version", "v2",
         "--doc", doc_url_or_token,
-        "--doc-format", "markdown",
+        "--doc-format", doc_format,
+        "--detail", "simple",
         "--as", "user",
     ]
     proc = await asyncio.create_subprocess_exec(
@@ -128,18 +142,119 @@ async def fetch_doc_as_markdown(doc_url_or_token: str) -> str:
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(
-            f"lark-cli docs +fetch rc={proc.returncode}: "
+            f"lark-cli docs +fetch ({doc_format}) rc={proc.returncode}: "
             f"{stderr.decode(errors='replace')[:300]}"
         )
     try:
         payload = json.loads(stdout.decode(errors="replace"))
-        content = payload["data"]["document"]["content"]
+        return payload["data"]["document"]["content"]
     except (json.JSONDecodeError, KeyError, TypeError) as ex:
         raise RuntimeError(
-            f"lark-cli docs +fetch 返回结构异常：{type(ex).__name__}: "
+            f"lark-cli docs +fetch ({doc_format}) 返回结构异常：{type(ex).__name__}: "
             f"{stdout.decode(errors='replace')[:200]}"
         ) from ex
-    return content
+
+
+def _parse_image_refs(xml: str) -> list[ImageRef]:
+    """从 XML 形式的文档内容里按文档顺序抠 <img/> 标签，返回 ImageRef 列表。
+
+    XML 里每个 <img> 必有 src（file_token）和 mime；name/width/height 在飞书侧偶尔
+    缺失，这里给空字符串/0 兜底。
+    """
+    refs: list[ImageRef] = []
+    for tag in _IMG_TAG_RE.findall(xml):
+        attrs = dict(_IMG_ATTR_RE.findall(tag))
+        token = attrs.get("src", "")
+        if not token:
+            continue
+        try:
+            width = int(attrs.get("width", "0"))
+        except ValueError:
+            width = 0
+        try:
+            height = int(attrs.get("height", "0"))
+        except ValueError:
+            height = 0
+        refs.append(ImageRef(
+            token=token,
+            name=attrs.get("name", ""),
+            mime=attrs.get("mime", "image/png"),
+            width=width,
+            height=height,
+        ))
+    return refs
+
+
+async def fetch_doc_as_markdown(doc_url_or_token: str) -> tuple[str, list[ImageRef]]:
+    """拉飞书文档：(markdown 正文, 按 DOM 顺序的图片清单)。
+
+    并行跑两次 lark-cli docs +fetch：
+    - --doc-format markdown → 给 Claude 看的可读正文（带 `![](authcode_url)` 占位）
+    - --doc-format xml      → 抠每张图的 file_token，用于后续 media-download
+
+    Markdown 里的 `![](...)` 和 XML 里的 <img/> 一一对应（同一文档同一顺序），调用方
+    可以用 list 索引把 markdown 占位重写成全局编号的 <image idx="N"/>。
+    """
+    md, xml = await asyncio.gather(
+        _fetch_doc_content(doc_url_or_token, "markdown"),
+        _fetch_doc_content(doc_url_or_token, "xml"),
+    )
+    return md, _parse_image_refs(xml)
+
+
+def rewrite_markdown_image_placeholders(md: str, refs: list[ImageRef], start_idx: int) -> str:
+    """把 markdown 里第 i 个 `![](...)` 换成 `<image idx="start+i" name="..." mime="..."/>`。
+
+    refs 的顺序必须跟 markdown 里 `![]()` 的出现顺序一致——上游 fetch_doc_as_markdown
+    并行跑同一份文档的两种 export，已经保证了。
+    """
+    counter = [0]
+    def sub(_m: re.Match) -> str:
+        i = counter[0]
+        counter[0] += 1
+        if i >= len(refs):
+            return _m.group(0)  # markdown 里多出来的 ![]()？保持原样
+        r = refs[i]
+        return f'<image idx="{start_idx + i}" name="{r.name}" mime="{r.mime}"/>'
+    return _MD_IMG_RE.sub(sub, md)
+
+
+async def download_doc_image(token: str) -> tuple[bytes, str]:
+    """lark-cli docs +media-download 下载一张图，返回 (字节, mime)。
+
+    lark-cli 限制 `--output` 必须是相对路径（防越界写），所以用 tempdir + cwd
+    切上下文。`--as user` 必填（docx 媒体跟文档共用 user OAuth 鉴权）。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        out_rel = "./img.bin"
+        cmd = [
+            LARK_CLI, "docs", "+media-download",
+            "--token", token,
+            "--output", out_rel,
+            "--as", "user",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=td,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"lark-cli docs +media-download rc={proc.returncode}: "
+                f"{(stderr or stdout).decode(errors='replace')[:300]}"
+            )
+        # lark-cli 在 stdout 给的是 JSON 元信息（含 mime/size 等），文件落在 cwd
+        try:
+            payload = json.loads(stdout.decode(errors="replace"))
+            mime = payload.get("data", {}).get("mime_type") or "image/png"
+        except (json.JSONDecodeError, AttributeError):
+            mime = "image/png"
+        out_abs = os.path.join(td, out_rel.lstrip("./"))
+        with open(out_abs, "rb") as f:
+            data = f.read()
+    return data, mime
 
 
 # --- doc QA via Claude -------------------------------------------------------
@@ -266,10 +381,12 @@ async def handle_doc_qa(evt: dict) -> None:
 
     started = time.time()
     try:
-        doc_md = await asyncio.wait_for(
+        doc_md, _imgs = await asyncio.wait_for(
             fetch_doc_as_markdown(doc), timeout=DOC_QA_TIMEOUT_SEC * 0.4
         )
-        log("doc_fetched", req_id=req_id, bytes=len(doc_md))
+        # 单轮 envelope 路径暂不支持图，丢掉 _imgs；markdown 里的 `![](...)` 占位
+        # 让模型自己判断（看不到图时它会说"图里没看到"）。
+        log("doc_fetched", req_id=req_id, bytes=len(doc_md), imgs=len(_imgs))
         answer = await asyncio.wait_for(
             answer_from_doc(question, doc_md),
             timeout=DOC_QA_TIMEOUT_SEC * 0.6,
@@ -314,7 +431,12 @@ RESET_COMMANDS = {"/reset", "/new", "重置", "清空"}
 
 SESSION_TTL_SEC = float(os.environ.get("SESSION_TTL_MIN", "30")) * 60
 
-HUMAN_SYSTEM_PROMPT = """你是飞书文档问答助手。用户会陆续给你一篇或多篇飞书文档（以 <document url="..."> 块的形式提供），并基于这些文档跟你多轮提问。
+_IMAGE_PROTOCOL_NOTE = """文档里的图片以占位符形式出现：`<image idx="N" name="..." mime="..."/>`。
+你看不到图本身，只能看到占位。如果回答这个问题确实需要看图（比如图里是截图、配置项、流程图、表格），
+调用工具 `mcp__lark-doc__fetch_doc_image`，参数 `{"idx": N}`，即可拿到实际图片内容继续作答。
+能从文字里答出来就别拉图——图会消耗 vision token，回答也变慢。一次问题最多拉 3 张。"""
+
+HUMAN_SYSTEM_PROMPT = f"""你是飞书文档问答助手。用户会陆续给你一篇或多篇飞书文档（以 <document url="..."> 块的形式提供），并基于这些文档跟你多轮提问。
 
 规则：
 - 只基于已提供的文档回答；文档里没有的信息直接说"文档里没找到"，不要凭常识补
@@ -322,16 +444,20 @@ HUMAN_SYSTEM_PROMPT = """你是飞书文档问答助手。用户会陆续给你�
 - 答得简洁。需要步骤就用编号列表
 - 不要把整段文档抄回来当作答案
 - 同时引用多篇文档时，注明引用了哪一篇（用 url 或简短的来源标识）
+
+{_IMAGE_PROTOCOL_NOTE}
 """
 
 # 新会话还没收到任何文档时用这个；轻量友好，鼓励但不强求贴文档。
 # 一旦后续真有 <document> 进对话历史，模型也能自然切换到基于文档作答。
-CHITCHAT_SYSTEM_PROMPT = """你是一个轻量的飞书机器人助手。主业是飞书文档问答，但用户也可以随便聊两句。
+CHITCHAT_SYSTEM_PROMPT = f"""你是一个轻量的飞书机器人助手。主业是飞书文档问答，但用户也可以随便聊两句。
 
 规则：
 - 没有 <document> 块时：友好、简短地回应即可。合适时可以提一句"也可以贴飞书文档链接让我读后再问"，但别每条都说
 - 出现 <document url="..."> 块后：切到严格文档问答——只基于文档作答，文档没提的直接说"文档里没找到"
 - 答得简洁，避免长篇大论
+
+{_IMAGE_PROTOCOL_NOTE}
 """
 
 
@@ -354,12 +480,67 @@ def strip_urls(text: str) -> str:
 
 # --- per-chat session state --------------------------------------------------
 
+# Claude 一轮里最多允许拉的图，防止它失控把整篇文档的图全拉一遍。
+# 上限是策略性的，不是技术限制；调高就是接受 token / latency 涨。
+MAX_IMAGES_PER_QUESTION = int(os.environ.get("MAX_IMAGES_PER_QUESTION", "3"))
+
+
+def _build_image_mcp_server(sess: "ChatSession"):
+    """给某个 ChatSession 构造一个进程内 MCP server，暴露 fetch_doc_image 工具。
+
+    工具实现 closure 抓住 sess，所以同一进程下不同 chat 互不串。
+    返回值给 ClaudeAgentOptions.mcp_servers 用。
+    """
+
+    @tool(
+        "fetch_doc_image",
+        "Fetch a specific document image by its idx (the number in the <image idx=\"N\"/> "
+        "placeholder). Returns the actual image bytes for vision analysis. Only use this "
+        "when answering genuinely requires seeing the image content (e.g. it's a screenshot, "
+        "diagram, table, or config UI); skip if text context already covers the answer.",
+        {"idx": int},
+    )
+    async def fetch_doc_image(args: dict[str, Any]) -> dict[str, Any]:
+        idx = args.get("idx")
+        if not isinstance(idx, int) or idx < 1 or idx > len(sess.images):
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"idx {idx!r} 越界。当前 session 共 {len(sess.images)} 张图（合法范围 1..{len(sess.images)}）。",
+                }],
+                "is_error": True,
+            }
+        ref = sess.images[idx - 1]
+        log("fetch_doc_image_start", chat_id=sess.chat_id, idx=idx, token=ref.token, name=ref.name)
+        try:
+            data, mime = await download_doc_image(ref.token)
+        except Exception as ex:  # noqa: BLE001
+            log("fetch_doc_image_failed", chat_id=sess.chat_id, idx=idx, error=str(ex)[:300])
+            return {
+                "content": [{"type": "text", "text": f"下载图 idx={idx} 失败：{type(ex).__name__}: {str(ex)[:200]}"}],
+                "is_error": True,
+            }
+        log("fetch_doc_image_ok", chat_id=sess.chat_id, idx=idx, bytes=len(data), mime=mime)
+        return {
+            "content": [
+                {
+                    "type": "image",
+                    "data": base64.b64encode(data).decode("ascii"),
+                    "mimeType": ref.mime or mime,
+                }
+            ],
+        }
+
+    return create_sdk_mcp_server(name="lark-doc", tools=[fetch_doc_image])
+
+
 @dataclass
 class ChatSession:
     chat_id: str
     client: ClaudeSDKClient | None              # 真正第一次问问题时才 spawn
-    doc_cache: dict[str, str] = field(default_factory=dict)         # url -> markdown
+    doc_cache: dict[str, str] = field(default_factory=dict)         # url -> markdown (含 <image idx="N"/> 占位)
     docs_in_client_context: set[str] = field(default_factory=set)   # 已塞进对话历史的 url
+    images: list[ImageRef] = field(default_factory=list)            # 全 session 累计的图，下标 = idx-1
     last_active: float = field(default_factory=time.time)
 
     def is_idle(self, ttl_sec: float) -> bool:
@@ -422,11 +603,21 @@ class SessionManager:
 
         system_prompt 为 None 时用 SessionManager 自带的默认 options；传值则覆盖
         system_prompt 字段。只在 spawn 那一刻生效，已有 client 的 session 不会重建。
+
+        同时把这个 session 专属的 `fetch_doc_image` MCP 工具挂上去：通过 closure
+        绑定到当前 session，Claude 调工具时按 idx 取 `sess.images[idx-1]`，再走
+        lark-cli docs +media-download 把图片下回来回填给模型。
         """
         if sess.client is None:
             opts = self._options
             if system_prompt is not None and system_prompt != opts.system_prompt:
                 opts = replace(opts, system_prompt=system_prompt)
+            mcp_server = _build_image_mcp_server(sess)
+            opts = replace(
+                opts,
+                mcp_servers={**(opts.mcp_servers if isinstance(opts.mcp_servers, dict) else {}), "lark-doc": mcp_server},
+                allowed_tools=[*opts.allowed_tools, "mcp__lark-doc__fetch_doc_image"],
+            )
             client = ClaudeSDKClient(options=opts)
             await client.connect()
             sess.client = client
@@ -456,10 +647,12 @@ _session_manager: SessionManager | None = None
 def _get_session_manager() -> SessionManager:
     global _session_manager
     if _session_manager is None:
+        # max_turns 给 tool round-trip 留余量：每张图拉一次 = 1 turn 工具调用 + 1 turn
+        # 给模型消化回复。MAX_IMAGES_PER_QUESTION × 2 + 1（兜底文本回复）。
         options = ClaudeAgentOptions(
             system_prompt=HUMAN_SYSTEM_PROMPT,
             allowed_tools=[],
-            max_turns=1,
+            max_turns=MAX_IMAGES_PER_QUESTION * 2 + 1,
         )
         _session_manager = SessionManager(options=options, ttl_sec=SESSION_TTL_SEC)
     return _session_manager
@@ -555,7 +748,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
             log("human_doc_qa_fetch", chat_id=chat_id, count=len(new_urls))
             for url in new_urls:
                 try:
-                    md = await asyncio.wait_for(
+                    md, imgs = await asyncio.wait_for(
                         fetch_doc_as_markdown(url),
                         timeout=DOC_QA_TIMEOUT_SEC * 0.4,
                     )
@@ -570,7 +763,21 @@ async def handle_human_doc_qa(evt: dict) -> None:
                     )
                     log("human_doc_qa_fetch_error", chat_id=chat_id, url=url, error=str(ex)[:300])
                     return
-                sess.doc_cache[url] = md
+                # 把本文档的图追加到 session 全局清单，并用全局 idx 改写 markdown
+                # 里的 `![](...)` 占位 → `<image idx="N" .../>`，供 Claude 看占位
+                # 决定是否调用 fetch_doc_image 工具实拉图。
+                start_idx = len(sess.images) + 1
+                md_with_placeholders = rewrite_markdown_image_placeholders(md, imgs, start_idx)
+                sess.images.extend(imgs)
+                sess.doc_cache[url] = md_with_placeholders
+                log(
+                    "human_doc_qa_fetch_done",
+                    chat_id=chat_id,
+                    url=url,
+                    bytes=len(md_with_placeholders),
+                    imgs=len(imgs),
+                    img_idx_range=f"{start_idx}..{start_idx + len(imgs) - 1}" if imgs else "-",
+                )
             sess.touch()
 
         # 只加载文档没问题 → 确认即停（不浪费一轮 Claude 推理）
