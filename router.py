@@ -112,8 +112,16 @@ def extract_message(evt_line: str) -> dict | None:
 async def stream_events() -> AsyncIterator[str]:
     cmd = [LARK_CLI, "event", "consume", "im.message.receive_v1", "--as", "bot"]
     log("starting", cmd=" ".join(cmd))
+    # stdin=PIPE 而非默认 inherit：lark-cli `event consume` 把 stdin EOF 当退出信号
+    # （为 AI subprocess caller 设计的优雅停机）。从 Python subprocess inherit 下来的
+    # stdin 在某些场景下会被 lark-cli 立刻判 EOF → rc=3 退出。给它一个我们永远不写
+    # 也不关的 PIPE，等价于 shell 里的 `< <(tail -f /dev/null)`，停机走 SIGTERM。
+    # stderr 透传到父进程，既方便看 lark-cli 的告警，也避免 PIPE 没人读时阻塞。
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=None,
     )
     assert proc.stdout
     try:
