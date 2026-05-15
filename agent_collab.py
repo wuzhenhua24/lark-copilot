@@ -664,12 +664,20 @@ def _get_session_manager() -> SessionManager:
 
 
 async def send_text_reply(chat_id: str, text: str) -> None:
-    """以 bot 身份发一条纯文本 DM。"""
+    """以 bot 身份发一条富文本 DM。
+
+    用 --markdown 而不是 --text：lark-cli 会自动包成飞书 post 富文本，
+    `**bold**`、有序/无序列表、`` `code` ``、链接等 markdown 语法在客户端会真渲染；
+    纯文本走 --markdown 也无副作用（没语法字符就跟纯文本一样）。
+
+    envelope 路径（agent ↔ agent，对端 agent 要按文本 JSON 解析）必须继续走
+    --text，本函数仅给 Human 模式用，所以这里可以放心切。
+    """
     cmd = [
         LARK_CLI, "im", "+messages-send",
         "--as", "bot",
         "--chat-id", chat_id,
-        "--text", text,
+        "--markdown", text,
     ]
     if DRY_RUN:
         log("dry_run_send_text", chat_id=chat_id, cmd=" ".join(shlex.quote(c) for c in cmd))
