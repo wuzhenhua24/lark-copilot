@@ -220,8 +220,13 @@ async def handle(evt: dict) -> None:
         if not BOT_OPEN_ID:
             log("skip_group_no_bot_open_id")
             return
-        if BOT_OPEN_ID not in _mention_open_ids(evt.get("mentions") or []):
-            return  # 群里没 @ 我，沉默就是金
+        mention_ids = _mention_open_ids(evt.get("mentions") or [])
+        if BOT_OPEN_ID not in mention_ids:
+            # 早期版本这里 "沉默就是金"，结果运维完全看不出 "没 @ 我" 和 "@ 了但
+            # BOT_OPEN_ID 配错 / mentions 解析丢字段" 的区别。低 QPS 场景下这条
+            # 日志加进来是值得的——出问题时一眼能看到 expected vs got。
+            log("skip_group_not_at_me", mentions=list(mention_ids), expected=BOT_OPEN_ID)
+            return
         if sender not in HUMAN_SENDERS:
             log("skip_group_untrusted_sender", sender=sender)
             return
@@ -248,7 +253,11 @@ async def handle(evt: dict) -> None:
 async def main() -> None:
     if not COLLAB_SENDERS and not HUMAN_SENDERS:
         log("warn_no_senders_configured")
-    if not BOT_OPEN_ID:
+    if BOT_OPEN_ID:
+        # 启动期把已加载的 BOT_OPEN_ID 打出来，方便运维一眼确认 .env 真生效了
+        # （而不是被 systemd / shell 吞了）。open_id 本身不是 secret。
+        log("bot_open_id_loaded", open_id=BOT_OPEN_ID)
+    else:
         log("warn_no_bot_open_id_group_chats_disabled")
     async for line in stream_events():
         if not line.strip():
