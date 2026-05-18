@@ -140,21 +140,24 @@ uv run python router.py
 
 **lark-copilot bot 自己的 open_id（填 `BOT_OPEN_ID`）**
 
-```bash
-# 1. 把 bot 拉到任一群（admin / bot manager 后台或群里 / 加 bot 的方式）
-# 2. router 跑起来（HUMAN_SENDERS 已填）
-# 3. 在群里随便 @bot 一句
-# 4. 日志里找 event_in，把那一行整条 raw 字段打印出来，找：
-#    event.message.mentions[].id.open_id
-#    （或者扁平 projection 下：mentions[].id.open_id）
-# 5. 填进 .env 的 BOT_OPEN_ID，重启
-```
-
-更快的办法：用 lark-cli 直接查（如果你有 bot 的应用 token）：
+直接问飞书的 bot self-info 接口：
 
 ```bash
-lark-cli contact +user-get --as bot --user-id <bot_app_id_or_open_id>
+lark-cli api GET /open-apis/bot/v3/info/ --as bot -q '.bot.open_id'
+# → "ou_xxxxxxxx..."
 ```
+
+`bot/v3/info` 是飞书原生 OpenAPI，response 直接挂在顶层 `bot` 字段（不在 `.data`
+下，跟新版 v4 接口不一样），所以 jq path 是 `.bot.open_id`。同条命令还能看到
+`app_name`，可顺手核对是不是本 bot（避免你机器上有多个 app 配置串号）：
+
+```bash
+lark-cli api GET /open-apis/bot/v3/info/ --as bot -q '{name:.bot.app_name, open_id:.bot.open_id}'
+```
+
+> 兜底：飞书开发后台「应用功能 → 机器人」页面通常也展示 bot 的 open_id。
+
+拿到后填进 `.env`，重启 systemd 服务即可。
 
 **peer agent bot 的 open_id（填 `COLLAB_SENDERS`）**
 
