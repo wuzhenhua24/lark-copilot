@@ -26,8 +26,10 @@ Envelope（单行 JSON 文本消息）:
 另外暴露一条 `handle_human_doc_qa`：给 HUMAN_SENDERS 白名单里的真人用户用，
 DM 里贴飞书 URL + 自然语言问题就行，答案作为纯文本回。**支持多轮**：
 - 每个会话单元维护一个 `ChatSession`（一个 ClaudeSDKClient + 文档缓存）
-  - DM：会话单元 = 整个 chat（per-chat 一份 session）
-  - 群聊：会话单元 = 单个**话题（thread）**（同群里每个话题独立 session，互不串扰）
+  - 会话单元 = `(chat_id, sender_id)`：DM 里每个 1v1 一份；群里每个用户在每个
+    群里独立一份。同群多人各自有独立 session，互不串扰。
+  - 这个键不依赖 thread/root_id（lark-cli event projection 不传那些字段），
+    群里用户**直接再 @bot 一次**就能续上一轮的文档和对话历史；不需要点开话题。
 - 后续追问可以省 URL，会复用之前缓存的文档
 - 单条消息可以同时贴多个 URL
 - `/reset` / `/new` / `重置` / `清空` 任一可清空当前会话单元
@@ -591,11 +593,10 @@ class ChatSession:
 class SessionManager:
     """per-session_key 多轮会话状态。
 
-    session_key 的语义：
-    - DM (p2p)：session_key = chat_id（一对一对话整体一份会话）
-    - 群聊 (group)：session_key = f"{chat_id}:{thread_root}"
-      thread_root 由 router 透过来：消息已在话题里时 = root_id；新开话题时 = message_id。
-      所以同一个群里每个话题（飞书 thread）一份独立会话，互不串扰。
+    session_key 的语义：统一用 `f"{chat_id}:{sender_id}"`，DM 和群聊一致。
+    - DM 里 sender_id 永远是对面那个人，等价于 per-chat 分桶
+    - 群聊里每个用户在每个群独立一份 session，多人协作互不串扰
+    - 不依赖飞书 thread/root_id（lark-cli event projection 没透出）
 
     并发模型：
     - 每个 session_key 一把 asyncio.Lock，所有访问该会话的代码都得拿它。
@@ -714,9 +715,15 @@ async def send_text_reply(
     `**bold**`、有序/无序列表、`` `code` ``、链接等 markdown 语法在客户端会真渲染；
     纯文本走 --markdown 也无副作用（没语法字符就跟纯文本一样）。
 
-    群聊（传 `reply_to_message_id`）走 `+messages-reply --reply-in-thread`，让
-    回复进入原消息的 thread，不会污染主聊天流。DM（没传 message_id）继续走
-    `+messages-send` 发到 chat-id，跟之前行为完全一致。
+    群聊（传 `reply_to_message_id`）走 `+messages-reply`（**不带**
+    `--reply-in-thread`），飞书 UI 上呈现为对原 @ 消息的"引用回复"——消息头部
+    显示原问题的引用条，bot 答的是哪条提问一目了然，但不开话题。DM（没传
+    message_id）继续走 `+messages-send` 发到 chat-id，跟之前行为完全一致。
+
+    为什么不开话题：话题内追问需要 root_id 才能复用 session，而 lark-cli 的
+    event projection 把 root_id / thread_id / parent_id 全 dropped 了。引用回复
+    的 UI 表现接近话题，但不需要追溯 thread 信息——session 改用 chat_id+sender_id
+    分桶后，用户直接再 @bot 就能续上下文。
 
     envelope 路径（agent ↔ agent，对端 agent 要按文本 JSON 解析）必须继续走
     --text，本函数仅给 Human 模式用，所以这里可以放心切。
@@ -726,7 +733,6 @@ async def send_text_reply(
             LARK_CLI, "im", "+messages-reply",
             "--as", "bot",
             "--message-id", reply_to_message_id,
-            "--reply-in-thread",
             "--markdown", text,
         ]
         log_event_dry = "dry_run_send_text_reply"
@@ -783,15 +789,16 @@ async def handle_human_doc_qa(evt: dict) -> None:
     输出：纯文本答案 / 加载确认 / 错误提示。
 
     群聊 vs DM：
-    - DM：所有回复走 `+messages-send` 到 chat_id（行为不变）。
-    - 群聊：所有回复走 `+messages-reply --reply-in-thread`，挂在用户那条 @bot
-      消息的 thread 下，不污染主聊天流。mention 占位 `@_user_N` 由 router 在
-      分发前剥掉，这里看到的 text 已经是纯净的问题文本。
-    - **session 分桶**：DM 以 chat_id 为 key（整聊一份会话）；群聊以
-      `chat_id:thread_root` 为 key —— 每个话题（飞书 thread）一份独立 session，
-      doc cache 和对话历史互不串扰。新开话题时 thread_root 取本条 message_id；
-      用户在已有话题里追问时取 root_id，session 自动沿用。
-      `/reset` 只清当前 session 单元（DM 是整聊；群里只是当前话题）。
+    - DM：所有回复走 `+messages-send` 到 chat_id（行为跟以前一致）。
+    - 群聊：所有回复走 `+messages-reply`（**不带** `--reply-in-thread`），呈现为
+      对原 @ 消息的"引用回复"——bot 答的是哪条提问 UI 上一目了然，但不开话题。
+      mention 占位 `@_user_N` 由 router 在分发前剥掉，这里看到的 text 已是纯净。
+    - **session 分桶**：统一用 `f"{chat_id}:{sender_id}"`。
+      - DM 里 sender_id 永远是对面那个人，等价于 per-chat 分桶
+      - 群里每个用户在每个群独立一份 session，多人协作互不串扰
+      - 用户在群里**直接再 @bot 一次**就能续 doc cache 和对话历史，不依赖
+        thread/root_id（lark-cli event projection 没透出这些字段）
+    - `/reset` 清当前用户在当前 chat 的 session（不影响别的用户）。
 
     流程（持有 per-session 锁内）：
     1. 文本是重置命令 → reset session、回确认
@@ -805,29 +812,21 @@ async def handle_human_doc_qa(evt: dict) -> None:
     """
     text = (evt.get("text") or "").strip()
     chat_id = evt.get("chat_id")
-    if not chat_id:
-        log("human_doc_qa_no_chat_id")
+    sender_id = evt.get("sender_id")
+    if not chat_id or not sender_id:
+        log("human_doc_qa_no_chat_id_or_sender", chat_id=chat_id, sender_id=sender_id)
         return
 
-    # 群里把所有回复都挂到原消息的 thread 上，主聊天流不会被刷屏；DM 不传，
-    # 保持老路径（+messages-send 到 chat-id）。chat_type == "group" 且有 message_id
-    # 才走 thread reply；任一缺失（比如 lark-cli projection 没透出 message_id）都
-    # 优雅降级回 plain send，宁可丑一点也不要发不出去。
+    # 群里走"引用回复"，bot 回复挂在用户那条 @ 消息下面；DM 不传，继续 +messages-send。
+    # message_id 缺失时（lark-cli projection 异常）优雅降级回 plain send。
     reply_to = (
         evt.get("message_id")
         if evt.get("chat_type") == "group" and evt.get("message_id")
         else None
     )
 
-    # 群聊：每个话题独立 session。thread_root 取 root_id（已在话题里）或
-    # message_id（本条 @ 即将作为新话题根）。两种情况下 session_key 都稳定指向
-    # 同一个话题，所以首条 @ 开 session、后续在话题里追问会沿用。
-    # DM：thread 概念不适用，session_key 退化为 chat_id（行为跟以前一致）。
-    if evt.get("chat_type") == "group":
-        thread_root = evt.get("root_id") or evt.get("message_id") or "_no_thread"
-        session_key = f"{chat_id}:{thread_root}"
-    else:
-        session_key = chat_id
+    # session 分桶：chat_id + sender_id 统一形式。DM 里 sender_id 唯一，群里每人独立。
+    session_key = f"{chat_id}:{sender_id}"
 
     mgr = _get_session_manager()
     lock = await mgr.lock_for(session_key)

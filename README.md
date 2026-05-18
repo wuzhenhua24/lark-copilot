@@ -201,11 +201,11 @@ uv run python router.py
 
 #### 对话
 
-每个**会话单元**维护一份会话状态：
+每个**会话单元** = `(chat_id, sender_id)`，DM 和群聊统一：
 
-- DM (1v1)：会话单元 = 整聊
-- 群聊：会话单元 = 单个**话题（thread）**，同群里每个话题独立一份 session
-  （doc cache + 对话历史互不串扰）；在话题里追问会自动沿用首条 @ 时的 session
+- DM (1v1)：sender_id 唯一，等价于 per-chat 一份 session
+- 群聊：每个用户在每个群独立一份 session，多人协作互不串扰；用户**直接再
+  @bot** 就能续上一轮的文档和对话历史（不用点开话题、不用引用回复）
 
 每份会话状态包含：
 
@@ -213,7 +213,11 @@ uv run python router.py
 - 一份 **doc cache**：URL → Markdown，避免同一文档被重复拉取
 - 一个 **last_active 时间戳**：`SESSION_TTL_MIN` 分钟无活动 → 整份状态被丢弃
 
-`/reset` 只清当前会话单元（群里就是当前话题，不影响别的话题）。
+`/reset` 只清当前用户在当前 chat 的会话单元（不影响别人）。
+
+群聊里 bot 回复通过 lark-cli `+messages-reply` 走"**引用回复**"，飞书 UI 上 bot
+的回复会带上原 @ 消息的引用条，一眼能看出是答哪条提问，但不开话题。这套设计
+跟同仓库的 [ops-qa-bot](../ops-qa-bot) 一致。
 
 支持的输入：
 

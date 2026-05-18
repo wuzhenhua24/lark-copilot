@@ -34,7 +34,7 @@ bot 不需要起名 / 拉群 / 被人 DM，但它得"存在"才能收事件、�
 |---|---|---|
 | `im:message.p2p_msg:readonly` | **应用身份** | bot 接收 DM 的 `im.message.receive_v1` 事件 |
 | `im:message.group_at_msg:readonly` | **应用身份** | bot 接收群里 @ 自己的 `im.message.receive_v1` 事件（**群聊功能必需**） |
-| `im:message:send` | **应用身份** | bot 发 ack envelope / 群里 reply-in-thread |
+| `im:message:send` | **应用身份** | bot 发 ack envelope / 群里 `+messages-reply` 引用回复 |
 | `docx:document:readonly` | **用户身份** | `lark-cli docs +fetch` 拉飞书文档 |
 | `drive:drive:readonly`（可选） | 用户身份 | 搜云空间文档 |
 
@@ -194,7 +194,7 @@ human_doc_qa_in → dry_run_send_text → human_doc_qa_done
 event_in chat_type=group → human_in_group → ... → dry_run_send_text_reply
 ```
 
-注意 `dry_run_send_text_reply` 里的命令是 `+messages-reply --reply-in-thread`，不是 `+messages-send`。
+注意 `dry_run_send_text_reply` 里的命令是 `+messages-reply`（**不带** `--reply-in-thread`），不是 `+messages-send`。群里 bot 走"引用回复"，UI 上挂在原 @ 消息下面。
 
 ### 4.4 envelope smoke test（如果跑 collab 模式）
 
