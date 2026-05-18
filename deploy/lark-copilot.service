@@ -1,0 +1,54 @@
+# lark-copilot systemd unit
+#
+# 用法：
+#   sudo cp deploy/lark-copilot.service /etc/systemd/system/
+#   # 改下面四处占位符为本机实际值：User / Group / WorkingDirectory / ExecStart 的 uv 路径
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lark-copilot
+#   journalctl -u lark-copilot -f
+
+[Unit]
+Description=lark-copilot · feishu doc QA worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# === 改这四个 ===
+User=lark-copilot
+Group=lark-copilot
+WorkingDirectory=/opt/lark-copilot
+# 推荐用 uv run，自动用 .venv 的 python。如果 uv 不在 /usr/local/bin，which uv 看一下。
+ExecStart=/usr/local/bin/uv run python router.py
+
+# .env 在 WorkingDirectory 里 (load_dotenv 已经处理)；如果你想把 env 从 systemd 注入，
+# 取消下面注释并指向你的 env 文件：
+# EnvironmentFile=/etc/lark-copilot.env
+
+# 日志走 journald，NDJSON 一行一条
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lark-copilot
+
+# 异常退出自动重启；间隔留长一点避免被飞书侧风控
+Restart=on-failure
+RestartSec=10s
+# 短时间内频繁失败就停下来等人工，避免 lark-cli token 在错误循环里被刷掉
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# 优雅停机：lark-cli event consume 把 stdin EOF 当退出信号。SIGTERM 也会被它正确处理；
+# 给 15s 让正在 in-flight 的回复发完再被 SIGKILL。
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+
+# 安全加固（可选，对功能没影响；如果遇到权限问题再放开）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# .venv / 缓存写入需要可写的家目录；如果你把整个仓库都设成只读，下面这行打开
+# ReadWritePaths=/opt/lark-copilot
+
+[Install]
+WantedBy=multi-user.target

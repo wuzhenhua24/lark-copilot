@@ -94,6 +94,12 @@ A: rpc.try_deliver 命中 req_id → 唤醒 await 的 Future → tool 返回 ans
 
 ---
 
+> **要部署到生产**：完整的端到端 runbook 见 [`deploy/README.md`](deploy/README.md)
+> （飞书应用配置 → 部署机环境 → env → smoke test → systemd → 回滚）。本文档保留
+> 概念解释和快速本地试跑，不重复展开部署步骤。
+
+---
+
 ## 飞书应用配置
 
 本仓库依赖一个**企业自建应用**承载 lark-cli 调用。要做的事：
