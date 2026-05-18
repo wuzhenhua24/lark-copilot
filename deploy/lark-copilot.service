@@ -26,9 +26,18 @@ ExecStart=/usr/local/bin/uv run python router.py
 # 取消下面注释并指向你的 env 文件：
 # EnvironmentFile=/etc/lark-copilot.env
 
-# 日志走 journald，NDJSON 一行一条
-StandardOutput=journal
-StandardError=journal
+# 日志落到 /var/log/lark-copilot/router.log（NDJSON 一行一条）。
+# - LogsDirectory= 让 systemd 在启动时自动创建 /var/log/lark-copilot 并 chown
+#   到 User=/Group=，跟 ProtectSystem=strict 兼容（自动加进 writable paths）。
+# - StandardOutput/StandardError 都用 append:PATH，进程崩重启不会截断老内容。
+# - stderr 和 stdout 合并到同一文件，事件流和 lark-cli 自己的告警按时间戳交错。
+# - 不再走 journal：要靠 journalctl 取就把 StandardOutput=journal 还原回来。
+# - rotation 见 deploy/lark-copilot.logrotate（systemd append: 自己不做切割）。
+#
+# 要求：systemd ≥ 240（append:）/ 235（LogsDirectory）。主流 LTS 都满足。
+LogsDirectory=lark-copilot
+StandardOutput=append:/var/log/lark-copilot/router.log
+StandardError=append:/var/log/lark-copilot/router.log
 SyslogIdentifier=lark-copilot
 
 # 异常退出自动重启；间隔留长一点避免被飞书侧风控

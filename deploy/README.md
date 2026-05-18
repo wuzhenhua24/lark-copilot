@@ -245,10 +245,45 @@ sudo cp deploy/lark-copilot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now lark-copilot
 sudo systemctl status lark-copilot
-journalctl -u lark-copilot -f --since "5 min ago"
 ```
 
-更新代码后：
+### 5.1 日志在哪
+
+默认配置下日志落到 **`/var/log/lark-copilot/router.log`**（NDJSON，一行一条）。
+目录由 `LogsDirectory=lark-copilot` 在 systemd 启动时自动创建并 chown 到 `User=`。
+
+```bash
+# 实时跟
+tail -f /var/log/lark-copilot/router.log
+
+# 结构化筛
+tail -F /var/log/lark-copilot/router.log | jq -c 'select(.event=="human_doc_qa_done")'
+
+# 跨切割文件 grep
+zgrep '"chat_id":"oc_xxx"' /var/log/lark-copilot/router.log*
+
+# 失败事件聚类（含历史归档）
+zcat -f /var/log/lark-copilot/router.log* | jq -r 'select(.event|test("_failed$|_error$|timeout$")) | .event' | sort | uniq -c
+```
+
+切割：把 `deploy/lark-copilot.logrotate` 装到 `/etc/logrotate.d/`，默认每天滚一次、
+保留 14 份、gzip 压缩、`copytruncate` 不需重启服务：
+
+```bash
+sudo cp deploy/lark-copilot.logrotate /etc/logrotate.d/lark-copilot
+sudo logrotate -d /etc/logrotate.d/lark-copilot   # dry-run 看一眼
+```
+
+> **想改回走 journald**：把 unit 里 `LogsDirectory=` / `StandardOutput=append:...` /
+> `StandardError=append:...` 三行换回 `StandardOutput=journal` + `StandardError=journal`，
+> 然后 `journalctl -u lark-copilot -f` 取日志即可。
+>
+> **想换日志路径**：unit 里 `LogsDirectory=lark-copilot` 决定的就是 `/var/log/<这里>`，
+> 改成别的名字（比如 `lark`）→ 日志目录变 `/var/log/lark/`；同时 append: 后面的路径
+> 和 logrotate 文件里的路径要同步改。要放到 `/var/log` 外部（如 `/data/...`），把
+> `LogsDirectory=` 去掉，改 `ReadWritePaths=/data/lark-copilot` + 自己 mkdir/chown。
+
+### 5.2 升级
 
 ```bash
 git pull
