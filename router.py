@@ -106,6 +106,10 @@ def extract_message(evt_line: str) -> dict | None:
     chat_id = msg.get("chat_id") or inner.get("chat_id")
     msg_type = msg.get("message_type") or inner.get("message_type")
     message_id = msg.get("message_id") or inner.get("message_id")
+    # root_id 是飞书话题（thread）的根消息 id。消息在某个话题里时这个字段非空，
+    # 顶层消息（包括"未来即将开新话题的那条 @"）则没有。下游用它把每个话题分桶
+    # 成独立 session：已在话题里→沿用 root_id；新开话题→用本条 message_id 做根。
+    root_id = msg.get("root_id") or inner.get("root_id") or None
     content_raw = msg.get("content") or inner.get("content")
 
     text = None
@@ -120,6 +124,7 @@ def extract_message(evt_line: str) -> dict | None:
         "chat_type": chat_type,
         "chat_id": chat_id,
         "message_id": message_id,
+        "root_id": root_id,
         "msg_type": msg_type,
         "text": text,
         "raw": raw,

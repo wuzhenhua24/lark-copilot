@@ -25,10 +25,12 @@ Envelope（单行 JSON 文本消息）:
 
 另外暴露一条 `handle_human_doc_qa`：给 HUMAN_SENDERS 白名单里的真人用户用，
 DM 里贴飞书 URL + 自然语言问题就行，答案作为纯文本回。**支持多轮**：
-- 每个 chat_id 维护一个 `ChatSession`（一个 ClaudeSDKClient + 文档缓存）
+- 每个会话单元维护一个 `ChatSession`（一个 ClaudeSDKClient + 文档缓存）
+  - DM：会话单元 = 整个 chat（per-chat 一份 session）
+  - 群聊：会话单元 = 单个**话题（thread）**（同群里每个话题独立 session，互不串扰）
 - 后续追问可以省 URL，会复用之前缓存的文档
 - 单条消息可以同时贴多个 URL
-- `/reset` / `/new` / `重置` / `清空` 任一可清空当前对话
+- `/reset` / `/new` / `重置` / `清空` 任一可清空当前会话单元
 - `SESSION_TTL_MIN`（默认 30 分钟）无活动自动过期
 """
 
@@ -547,16 +549,16 @@ def _build_image_mcp_server(sess: "ChatSession"):
                 "is_error": True,
             }
         ref = sess.images[idx - 1]
-        log("fetch_doc_image_start", chat_id=sess.chat_id, idx=idx, token=ref.token, name=ref.name)
+        log("fetch_doc_image_start", session_key=sess.session_key, idx=idx, token=ref.token, name=ref.name)
         try:
             data, mime = await download_doc_image(ref.token)
         except Exception as ex:  # noqa: BLE001
-            log("fetch_doc_image_failed", chat_id=sess.chat_id, idx=idx, error=str(ex)[:300])
+            log("fetch_doc_image_failed", session_key=sess.session_key, idx=idx, error=str(ex)[:300])
             return {
                 "content": [{"type": "text", "text": f"下载图 idx={idx} 失败：{type(ex).__name__}: {str(ex)[:200]}"}],
                 "is_error": True,
             }
-        log("fetch_doc_image_ok", chat_id=sess.chat_id, idx=idx, bytes=len(data), mime=mime)
+        log("fetch_doc_image_ok", session_key=sess.session_key, idx=idx, bytes=len(data), mime=mime)
         return {
             "content": [
                 {
@@ -572,7 +574,7 @@ def _build_image_mcp_server(sess: "ChatSession"):
 
 @dataclass
 class ChatSession:
-    chat_id: str
+    session_key: str                            # DM = chat_id；群聊 = "chat_id:thread_root"
     client: ClaudeSDKClient | None              # 真正第一次问问题时才 spawn
     doc_cache: dict[str, str] = field(default_factory=dict)         # url -> markdown (含 <image idx="N"/> 占位)
     docs_in_client_context: set[str] = field(default_factory=set)   # 已塞进对话历史的 url
@@ -587,12 +589,18 @@ class ChatSession:
 
 
 class SessionManager:
-    """per-chat 多轮会话状态。
+    """per-session_key 多轮会话状态。
+
+    session_key 的语义：
+    - DM (p2p)：session_key = chat_id（一对一对话整体一份会话）
+    - 群聊 (group)：session_key = f"{chat_id}:{thread_root}"
+      thread_root 由 router 透过来：消息已在话题里时 = root_id；新开话题时 = message_id。
+      所以同一个群里每个话题（飞书 thread）一份独立会话，互不串扰。
 
     并发模型：
-    - 每个 chat_id 一把 asyncio.Lock，所有访问该 chat 的代码都得拿它。
-    - 不同 chat 的请求真正并行（每个 chat 独立 ClaudeSDKClient，互不阻塞）。
-    - 同一 chat 的连续两条消息串行，避免对话历史交错。
+    - 每个 session_key 一把 asyncio.Lock，所有访问该会话的代码都得拿它。
+    - 不同 session_key 的请求真正并行（独立 ClaudeSDKClient，互不阻塞）。
+    - 同一 session_key 的连续两条消息串行，避免对话历史交错。
 
     生命周期：
     - 创建：第一次有 user 发消息时（仅加载文档不开 client）
@@ -608,28 +616,28 @@ class SessionManager:
         self._chat_locks: dict[str, asyncio.Lock] = {}
         self._dict_lock = asyncio.Lock()
 
-    async def lock_for(self, chat_id: str) -> asyncio.Lock:
+    async def lock_for(self, session_key: str) -> asyncio.Lock:
         async with self._dict_lock:
-            lock = self._chat_locks.get(chat_id)
+            lock = self._chat_locks.get(session_key)
             if lock is None:
                 lock = asyncio.Lock()
-                self._chat_locks[chat_id] = lock
+                self._chat_locks[session_key] = lock
             return lock
 
-    async def get_or_create(self, chat_id: str) -> ChatSession:
-        """返回 chat_id 的 session；不存在或已过期就新建。
+    async def get_or_create(self, session_key: str) -> ChatSession:
+        """返回 session_key 对应的 session；不存在或已过期就新建。
 
-        调用方**必须**先持有 lock_for(chat_id)。
+        调用方**必须**先持有 lock_for(session_key)。
         """
-        sess = self._sessions.get(chat_id)
+        sess = self._sessions.get(session_key)
         if sess and sess.is_idle(self._ttl):
-            log("session_evict_idle", chat_id=chat_id)
-            await self._destroy_locked(chat_id)
+            log("session_evict_idle", session_key=session_key)
+            await self._destroy_locked(session_key)
             sess = None
         if sess is None:
-            sess = ChatSession(chat_id=chat_id, client=None)
-            self._sessions[chat_id] = sess
-            log("session_created", chat_id=chat_id)
+            sess = ChatSession(session_key=session_key, client=None)
+            self._sessions[session_key] = sess
+            log("session_created", session_key=session_key)
         return sess
 
     async def ensure_client(
@@ -657,22 +665,22 @@ class SessionManager:
             client = ClaudeSDKClient(options=opts)
             await client.connect()
             sess.client = client
-            log("session_client_spawned", chat_id=sess.chat_id)
+            log("session_client_spawned", session_key=sess.session_key)
         return sess.client
 
-    async def reset(self, chat_id: str) -> bool:
-        """显式销毁。调用方持有 lock_for(chat_id)。返回是否真的销毁了。"""
-        return await self._destroy_locked(chat_id)
+    async def reset(self, session_key: str) -> bool:
+        """显式销毁。调用方持有 lock_for(session_key)。返回是否真的销毁了。"""
+        return await self._destroy_locked(session_key)
 
-    async def _destroy_locked(self, chat_id: str) -> bool:
-        sess = self._sessions.pop(chat_id, None)
+    async def _destroy_locked(self, session_key: str) -> bool:
+        sess = self._sessions.pop(session_key, None)
         if sess is None:
             return False
         if sess.client is not None:
             try:
                 await sess.client.disconnect()
             except Exception as ex:  # noqa: BLE001
-                log("session_client_disconnect_error", chat_id=chat_id, error=str(ex)[:200])
+                log("session_client_disconnect_error", session_key=session_key, error=str(ex)[:200])
         return True
 
 
@@ -779,18 +787,20 @@ async def handle_human_doc_qa(evt: dict) -> None:
     - 群聊：所有回复走 `+messages-reply --reply-in-thread`，挂在用户那条 @bot
       消息的 thread 下，不污染主聊天流。mention 占位 `@_user_N` 由 router 在
       分发前剥掉，这里看到的 text 已经是纯净的问题文本。
-    - session 仍以 chat_id 为 key，所以同一个群共享一套文档缓存和对话历史。
-      这是有意为之：群成员协作问答时能复用别人加载的文档；如果会冲突，可
-      用 `/reset` 清。
+    - **session 分桶**：DM 以 chat_id 为 key（整聊一份会话）；群聊以
+      `chat_id:thread_root` 为 key —— 每个话题（飞书 thread）一份独立 session，
+      doc cache 和对话历史互不串扰。新开话题时 thread_root 取本条 message_id；
+      用户在已有话题里追问时取 root_id，session 自动沿用。
+      `/reset` 只清当前 session 单元（DM 是整聊；群里只是当前话题）。
 
-    流程（持有 per-chat 锁内）：
+    流程（持有 per-session 锁内）：
     1. 文本是重置命令 → reset session、回确认
     2. 抠出新 URL（不在缓存里的），逐个 fetch 进缓存
     3. 没问题、只加载文档 → 回确认就停（client 不开）
     4. 有问题 → 确保 client 已 spawn，把"还没塞进对话历史的文档 + 问题"作为一轮发出去
     5. touch session 续命
 
-    `/reset`、`/new`、`重置`、`清空` 任一作为单独消息时清空当前对话。
+    `/reset`、`/new`、`重置`、`清空` 任一作为单独消息时清空当前会话单元。
     超过 SESSION_TTL_MIN 分钟没有活动会被 lazy evict。
     """
     text = (evt.get("text") or "").strip()
@@ -809,11 +819,21 @@ async def handle_human_doc_qa(evt: dict) -> None:
         else None
     )
 
+    # 群聊：每个话题独立 session。thread_root 取 root_id（已在话题里）或
+    # message_id（本条 @ 即将作为新话题根）。两种情况下 session_key 都稳定指向
+    # 同一个话题，所以首条 @ 开 session、后续在话题里追问会沿用。
+    # DM：thread 概念不适用，session_key 退化为 chat_id（行为跟以前一致）。
+    if evt.get("chat_type") == "group":
+        thread_root = evt.get("root_id") or evt.get("message_id") or "_no_thread"
+        session_key = f"{chat_id}:{thread_root}"
+    else:
+        session_key = chat_id
+
     mgr = _get_session_manager()
-    lock = await mgr.lock_for(chat_id)
+    lock = await mgr.lock_for(session_key)
     async with lock:
         if text in RESET_COMMANDS:
-            ok = await mgr.reset(chat_id)
+            ok = await mgr.reset(session_key)
             await send_text_reply(
                 chat_id,
                 "✅ 已重置对话。下次贴一个飞书文档链接 + 问题开始新一轮。"
@@ -821,10 +841,10 @@ async def handle_human_doc_qa(evt: dict) -> None:
                 "目前没有活跃对话可以重置。直接贴文档 + 问题就行。",
                 reply_to_message_id=reply_to,
             )
-            log("human_doc_qa_reset", chat_id=chat_id, had_session=ok)
+            log("human_doc_qa_reset", chat_id=chat_id, session_key=session_key, had_session=ok)
             return
 
-        sess = await mgr.get_or_create(chat_id)
+        sess = await mgr.get_or_create(session_key)
         urls = extract_urls(text)
         new_urls = [u for u in urls if u not in sess.doc_cache]
         question = strip_urls(text)
@@ -839,7 +859,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
 
         # 拉新文档
         if new_urls:
-            log("human_doc_qa_fetch", chat_id=chat_id, count=len(new_urls))
+            log("human_doc_qa_fetch", chat_id=chat_id, session_key=session_key, count=len(new_urls))
             for url in new_urls:
                 try:
                     md, imgs = await asyncio.wait_for(
@@ -852,7 +872,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
                         f"⌛ 拉文档超时：{url}",
                         reply_to_message_id=reply_to,
                     )
-                    log("human_doc_qa_fetch_timeout", chat_id=chat_id, url=url)
+                    log("human_doc_qa_fetch_timeout", chat_id=chat_id, session_key=session_key, url=url)
                     return
                 except Exception as ex:  # noqa: BLE001
                     await send_text_reply(
@@ -860,7 +880,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
                         f"❌ 拉文档失败：{url}\n{type(ex).__name__}: {str(ex)[:200]}",
                         reply_to_message_id=reply_to,
                     )
-                    log("human_doc_qa_fetch_error", chat_id=chat_id, url=url, error=str(ex)[:300])
+                    log("human_doc_qa_fetch_error", chat_id=chat_id, session_key=session_key, url=url, error=str(ex)[:300])
                     return
                 # 把本文档的图追加到 session 全局清单，并用全局 idx 改写 markdown
                 # 里的 `![](...)` 占位 → `<image idx="N" .../>`，供 Claude 看占位
@@ -872,6 +892,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
                 log(
                     "human_doc_qa_fetch_done",
                     chat_id=chat_id,
+                    session_key=session_key,
                     url=url,
                     bytes=len(md_with_placeholders),
                     imgs=len(imgs),
@@ -886,6 +907,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
             log(
                 "human_doc_qa_default_summary",
                 chat_id=chat_id,
+                session_key=session_key,
                 doc_count=len(urls),
                 new_docs=len(new_urls),
             )
@@ -902,7 +924,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
                 f"❌ 启动模型失败：{type(ex).__name__}: {str(ex)[:200]}",
                 reply_to_message_id=reply_to,
             )
-            log("session_client_spawn_failed", chat_id=chat_id, error=str(ex)[:300])
+            log("session_client_spawn_failed", chat_id=chat_id, session_key=session_key, error=str(ex)[:300])
             return
 
         # 这次需要补发哪些文档到对话历史里
@@ -920,6 +942,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
         log(
             "human_doc_qa_in",
             chat_id=chat_id,
+            session_key=session_key,
             q_preview=question[:80],
             inject_docs=len(to_inject),
             total_docs=len(sess.doc_cache),
@@ -937,7 +960,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
                 "⌛ 推理超时。文档可能太长，或者临时网络抖了一下。可以试着 /reset 重开或简化问题。",
                 reply_to_message_id=reply_to,
             )
-            log("human_doc_qa_timeout", chat_id=chat_id, took_ms=int((time.time() - started) * 1000))
+            log("human_doc_qa_timeout", chat_id=chat_id, session_key=session_key, took_ms=int((time.time() - started) * 1000))
             return
         except Exception as ex:  # noqa: BLE001
             await send_text_reply(
@@ -945,7 +968,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
                 f"❌ 模型出错：{type(ex).__name__}: {str(ex)[:200]}",
                 reply_to_message_id=reply_to,
             )
-            log("human_doc_qa_error", chat_id=chat_id, error=str(ex)[:300])
+            log("human_doc_qa_error", chat_id=chat_id, session_key=session_key, error=str(ex)[:300])
             return
 
         for url in to_inject:
@@ -960,6 +983,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
         log(
             "human_doc_qa_done",
             chat_id=chat_id,
+            session_key=session_key,
             took_ms=int((time.time() - started) * 1000),
             answer_len=len(answer),
         )

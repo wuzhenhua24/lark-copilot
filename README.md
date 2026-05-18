@@ -201,11 +201,19 @@ uv run python router.py
 
 #### 对话
 
-每个 chat（你和 bot 的 1v1）维护一份会话状态：
+每个**会话单元**维护一份会话状态：
+
+- DM (1v1)：会话单元 = 整聊
+- 群聊：会话单元 = 单个**话题（thread）**，同群里每个话题独立一份 session
+  （doc cache + 对话历史互不串扰）；在话题里追问会自动沿用首条 @ 时的 session
+
+每份会话状态包含：
 
 - 一份 **ClaudeSDKClient**：多轮对话历史在它内部，能记住上一轮的文档和回答
 - 一份 **doc cache**：URL → Markdown，避免同一文档被重复拉取
 - 一个 **last_active 时间戳**：`SESSION_TTL_MIN` 分钟无活动 → 整份状态被丢弃
+
+`/reset` 只清当前会话单元（群里就是当前话题，不影响别的话题）。
 
 支持的输入：
 
