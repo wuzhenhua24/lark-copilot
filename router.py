@@ -70,6 +70,10 @@ HUMAN_SENDERS = {
     s for s in os.environ.get("HUMAN_SENDERS", "").split(",") if s.strip()
 }
 
+# 调试开关：每条入站事件都额外打一行 event_raw（含 lark-cli 原始 payload）。
+# 默认关，开了对日志体积影响很大；只在排查"字段在哪/有没有"这类问题时临时打开。
+DEBUG_DUMP_RAW = os.environ.get("DEBUG_DUMP_RAW", "").strip() == "1"
+
 
 def log(event: str, **fields: object) -> None:
     rec = {"ts": int(time.time()), "event": event, **fields}
@@ -250,6 +254,8 @@ async def main() -> None:
             message_id=evt.get("message_id"),
             root_id=evt.get("root_id"),
         )
+        if DEBUG_DUMP_RAW:
+            log("event_raw", raw=evt.get("raw"))
         try:
             await handle(evt)
         except Exception as ex:
