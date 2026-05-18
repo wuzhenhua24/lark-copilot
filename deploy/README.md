@@ -118,8 +118,7 @@ cp .env.example .env
 |---|---|---|
 | `DRY_RUN` | 是 | **首次部署保持 `1`**（只 log 不真发回复），通了再切 `0` |
 | `COLLAB_SENDERS` | 跑 envelope 才填 | peer agent 的 bot open_id，逗号分隔可多个 |
-| `HUMAN_SENDERS` | 跑 human / 群聊才填 | 允许提问的真人 open_id，逗号分隔可多个；**群聊 @bot 的发送者也必须在此名单** |
-| `BOT_OPEN_ID` | 跑群聊才填 | lark-copilot bot 自己的 open_id，群里识别 "@ 了我" 用；不填则群聊整体禁用 |
+| `HUMAN_SENDERS` | 跑 human / 群聊才填 | 允许提问的真人 open_id，逗号分隔可多个；**群聊 @bot 的发送者也必须在此名单**（"只在 @ 时响应"由飞书 scope 兜底，代码层不做 mentions 匹配） |
 | `DOC_FETCH_TIMEOUT_SEC` | 否 | 拉文档硬超时，默认 30 |
 | `INFERENCE_TIMEOUT_SEC` | 否 | 单轮推理硬超时，含 vision tool round-trip，默认 120 |
 | `SESSION_TTL_MIN` | 否 | Human/群聊 会话空闲多少分钟回收，默认 30 |
@@ -137,27 +136,6 @@ uv run python router.py
 # 3. 日志里找 `skip_untrusted_sender`，复制 `sender` 字段（形如 ou_xxxx）
 # 4. 填进 .env 的 HUMAN_SENDERS，Ctrl+C 重启 router
 ```
-
-**lark-copilot bot 自己的 open_id（填 `BOT_OPEN_ID`）**
-
-直接问飞书的 bot self-info 接口：
-
-```bash
-lark-cli api GET /open-apis/bot/v3/info/ --as bot -q '.bot.open_id'
-# → "ou_xxxxxxxx..."
-```
-
-`bot/v3/info` 是飞书原生 OpenAPI，response 直接挂在顶层 `bot` 字段（不在 `.data`
-下，跟新版 v4 接口不一样），所以 jq path 是 `.bot.open_id`。同条命令还能看到
-`app_name`，可顺手核对是不是本 bot（避免你机器上有多个 app 配置串号）：
-
-```bash
-lark-cli api GET /open-apis/bot/v3/info/ --as bot -q '{name:.bot.app_name, open_id:.bot.open_id}'
-```
-
-> 兜底：飞书开发后台「应用功能 → 机器人」页面通常也展示 bot 的 open_id。
-
-拿到后填进 `.env`，重启 systemd 服务即可。
 
 **peer agent bot 的 open_id（填 `COLLAB_SENDERS`）**
 
@@ -305,8 +283,8 @@ sudo systemctl restart lark-copilot
 | `send_*_failed` 报权限 | bot 缺 `im:message:send` 应用身份 scope；改完 scope 记得发版+审核 |
 | `lark-cli docs +fetch` 失败 | (a) user 没登录 / 没勾 `docx:document:readonly`（**用户身份**） (b) 登录 user 对该文档没查看权限 —— 让贴文档的人先把文档分享出来 (c) scope 改过但 user 没重新 `auth login` |
 | `warn_no_senders_configured` | `.env` 里 `COLLAB_SENDERS` 和 `HUMAN_SENDERS` 都没填，所有发件人都会被 `skip_untrusted_sender` 丢 |
-| `warn_no_bot_open_id_group_chats_disabled` | 没填 `BOT_OPEN_ID`，群聊整体禁用；DM 不受影响 |
-| 群里 @bot 没反应 | (1) `BOT_OPEN_ID` 没配或配错 (2) `im:message.group_at_msg:readonly` scope 没勾 (3) 事件订阅没加 `im.message.receive_v1` 的应用身份订阅 (4) 发件人不在 `HUMAN_SENDERS` —— 看日志 `skip_group_untrusted_sender` |
+| 群里 @bot 没反应 | (1) `im:message.group_at_msg:readonly` scope 没勾在**应用身份** —— bot 根本收不到群事件，连 `event_in chat_type=group` 都不会出现 (2) 事件订阅没加 `im.message.receive_v1` 的应用身份订阅 (3) 发件人不在 `HUMAN_SENDERS` —— 看日志 `skip_group_untrusted_sender` (4) bot 没被拉进那个群 |
+| 群里 bot 回复了不该回的消息 | 你勾了更宽的 `im:message.group_msg:readonly` scope，结果 bot 能收到群里所有消息。改回 `im:message.group_at_msg:readonly` 即可——这层过滤是飞书 scope 负责，代码不再做 mentions 匹配 |
 | A 调工具后超时 | (a) B 没起 / (b) B 还在 DRY_RUN=1（不会真回） / (c) `COLLAB_SENDERS` 没含 A 的 bot open_id |
 | 答案过长被截 | B 自动按 ~28KB 字节裁 `answer` 字段并打 `truncated:true`；要完整内容打开原文档 |
 | 媒体下载（图）超时 | 部分网络下 `docs +media-download` 走 https_proxy 会 TLS handshake 超时。`.env` 里取消注释 `LARK_CLI_NO_PROXY=1` 让它绕代理 |

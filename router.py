@@ -10,8 +10,13 @@ lark-copilot · dispatcher
 
 会话场景：
 - **DM (p2p)**：发件人发的任何消息都被视为对 bot 的提问。
-- **群聊 (group)**：必须 @bot（`BOT_OPEN_ID` 在 `message.mentions` 里）才会触发，
-  避免群里的闲聊把 bot 卷进去。collab/envelope 路径仍仅限 DM（双 agent 协作不会在群里）。
+- **群聊 (group)**：bot 在群里"只听见 @ 自己的消息"这件事，完全交给飞书 scope
+  做（`im:message.group_at_msg:readonly` 限制了能收到的事件就是 @bot 的，没勾
+  更宽的 `im:message.group_msg:readonly` 就拿不到群里别的消息）。所以代码这层
+  不再做 mentions 匹配——之前那道 gate 看着是 belt-and-suspenders，实际上
+  lark-cli 的 event projection 不传 mentions 字段，反而让所有群消息都被自己
+  拦掉。群里仍然要求发件人在 `HUMAN_SENDERS`，那才是真正的访问控制。
+  collab/envelope 路径仍仅限 DM（双 agent 协作不会在群里）。
   群里的回复走 `+messages-reply --reply-in-thread`，保持线程整洁。
 
 身份与限制：
@@ -60,15 +65,10 @@ COLLAB_SENDERS = {
 # 真人用户 open_id 白名单（逗号分隔）。这些发件人发自然语言（飞书 URL +
 # 问题），走 agent_collab.handle_human_doc_qa（plain text in/out）。
 # 不在 COLLAB_SENDERS / HUMAN_SENDERS 任一名单里的发件人一律丢，既是安全门
-# 也是噪音过滤。
+# 也是噪音过滤。群聊场景里也用同一份白名单。
 HUMAN_SENDERS = {
     s for s in os.environ.get("HUMAN_SENDERS", "").split(",") if s.strip()
 }
-
-# lark-copilot bot 自己的 open_id。群聊里用来识别 "是否 @ 了我"：飞书把每个 @
-# 渲染成 text 里的 `@_user_N` 占位 + mentions 数组里同 key 的实体对象。没配
-# BOT_OPEN_ID 时群聊会**静默忽略所有消息**——比放开触发安全，但要求部署时必填。
-BOT_OPEN_ID = os.environ.get("BOT_OPEN_ID", "").strip()
 
 
 def log(event: str, **fields: object) -> None:
@@ -107,9 +107,6 @@ def extract_message(evt_line: str) -> dict | None:
     msg_type = msg.get("message_type") or inner.get("message_type")
     message_id = msg.get("message_id") or inner.get("message_id")
     content_raw = msg.get("content") or inner.get("content")
-    # 飞书把 mentions 放在 message.mentions：[{key:"@_user_1", id:{open_id:"ou_xxx"}, ...}]
-    # text 里则是 "@_user_1 你好"，要在分发后用 key 替换成空。
-    mentions = msg.get("mentions") or inner.get("mentions") or []
 
     text = None
     if msg_type == "text" and content_raw:
@@ -125,33 +122,13 @@ def extract_message(evt_line: str) -> dict | None:
         "message_id": message_id,
         "msg_type": msg_type,
         "text": text,
-        "mentions": mentions,
         "raw": raw,
     }
 
 
-def _mention_open_ids(mentions: list) -> set[str]:
-    """从 mentions 数组里抠所有被 @ 的 open_id。
-
-    每个元素结构：`{key:"@_user_N", id:{open_id:"ou_xxx"|...}, name, tenant_key}`。
-    id 也可能扁平成字符串（不同 lark-cli 版本 projection 差异），都兜底。
-    """
-    out: set[str] = set()
-    for m in mentions or []:
-        if not isinstance(m, dict):
-            continue
-        ident = m.get("id")
-        if isinstance(ident, dict):
-            oid = ident.get("open_id") or ident.get("user_id")
-            if isinstance(oid, str) and oid:
-                out.add(oid)
-        elif isinstance(ident, str) and ident:
-            out.add(ident)
-    return out
-
-
-# `@_user_1`、`@_user_12` 之类的 mention 占位。飞书在 text 里就是这种形式，
-# 真实姓名 / open_id 都在 mentions 数组里。@_all 是 "@所有人"，也一并剥掉。
+# `@_user_1`、`@_user_12` 之类的 mention 占位。飞书在群里把 @ 渲染成 text 里这种
+# 形式，真实姓名 / open_id 单独放在 message.mentions 数组里（我们不消费）。
+# @_all 是 "@所有人"，也一并剥掉，下游拿到的 text 是纯净的问题文本。
 _MENTION_PLACEHOLDER_RE = re.compile(r"@_(?:user_\d+|all)")
 
 
@@ -213,20 +190,12 @@ async def handle(evt: dict) -> None:
         log("skip_no_sender")
         return
 
-    # 群里只跑 human 路径，且必须 @bot 才触发：群是吵闹环境，没有 mention gate
-    # 一开机器人就会被普通聊天卷进去刷屏。collab/envelope 协议在双 agent DM 里
-    # 跑，群里出现 envelope 是配置错误，直接忽略掉更安全。
+    # 群里只跑 human 路径。"只在被 @ 时响应"由飞书 scope 兜底（详见模块 docstring），
+    # 代码这层不做 mentions 匹配。HUMAN_SENDERS 是真正的访问控制：群里不在白名单
+    # 的人 @ bot 也不会触发，避免被不相干的人借走算力 / 拉文档。
+    # collab/envelope 协议在双 agent DM 里跑，群里出现 envelope 是配置错误，
+    # 直接忽略掉更安全。
     if chat_type == "group":
-        if not BOT_OPEN_ID:
-            log("skip_group_no_bot_open_id")
-            return
-        mention_ids = _mention_open_ids(evt.get("mentions") or [])
-        if BOT_OPEN_ID not in mention_ids:
-            # 早期版本这里 "沉默就是金"，结果运维完全看不出 "没 @ 我" 和 "@ 了但
-            # BOT_OPEN_ID 配错 / mentions 解析丢字段" 的区别。低 QPS 场景下这条
-            # 日志加进来是值得的——出问题时一眼能看到 expected vs got。
-            log("skip_group_not_at_me", mentions=list(mention_ids), expected=BOT_OPEN_ID)
-            return
         if sender not in HUMAN_SENDERS:
             log("skip_group_untrusted_sender", sender=sender)
             return
@@ -253,12 +222,6 @@ async def handle(evt: dict) -> None:
 async def main() -> None:
     if not COLLAB_SENDERS and not HUMAN_SENDERS:
         log("warn_no_senders_configured")
-    if BOT_OPEN_ID:
-        # 启动期把已加载的 BOT_OPEN_ID 打出来，方便运维一眼确认 .env 真生效了
-        # （而不是被 systemd / shell 吞了）。open_id 本身不是 secret。
-        log("bot_open_id_loaded", open_id=BOT_OPEN_ID)
-    else:
-        log("warn_no_bot_open_id_group_chats_disabled")
     async for line in stream_events():
         if not line.strip():
             continue
