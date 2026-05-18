@@ -8,11 +8,16 @@ lark-copilot · dispatcher
 - `HUMAN_SENDERS`  → `agent_collab.handle_human_doc_qa`（自然语言 in / 纯文本 out）
 - 不在任一白名单的发件人一律丢，作为安全门 + 噪音过滤
 
+会话场景：
+- **DM (p2p)**：发件人发的任何消息都被视为对 bot 的提问。
+- **群聊 (group)**：必须 @bot（`BOT_OPEN_ID` 在 `message.mentions` 里）才会触发，
+  避免群里的闲聊把 bot 卷进去。collab/envelope 路径仍仅限 DM（双 agent 协作不会在群里）。
+  群里的回复走 `+messages-reply --reply-in-thread`，保持线程整洁。
+
 身份与限制：
 - `im.message.receive_v1` 事件在飞书 Open Platform 是**应用级**的，只支持 `--as bot`
   订阅。没有"以 user 身份订阅自己收到的 DM"这条路径。
-- 所以这一侧 router 跑 `--as bot`，监听的是 **lark-copilot bot 收到的 DM**；peer agent
-  发 envelope 时也得 DM 这个 bot。
+- 所以这一侧 router 跑 `--as bot`，监听的是 **lark-copilot bot 收到的消息**。
 - 文档拉取（`agent_collab.fetch_doc_as_markdown`）继续走 `--as user`，因为 docx 读权限
   挂在登录 user 的 OAuth 上。两个身份在同一进程里 per-command 切换没问题。
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -59,6 +65,11 @@ HUMAN_SENDERS = {
     s for s in os.environ.get("HUMAN_SENDERS", "").split(",") if s.strip()
 }
 
+# lark-copilot bot 自己的 open_id。群聊里用来识别 "是否 @ 了我"：飞书把每个 @
+# 渲染成 text 里的 `@_user_N` 占位 + mentions 数组里同 key 的实体对象。没配
+# BOT_OPEN_ID 时群聊会**静默忽略所有消息**——比放开触发安全，但要求部署时必填。
+BOT_OPEN_ID = os.environ.get("BOT_OPEN_ID", "").strip()
+
 
 def log(event: str, **fields: object) -> None:
     rec = {"ts": int(time.time()), "event": event, **fields}
@@ -94,7 +105,11 @@ def extract_message(evt_line: str) -> dict | None:
     chat_type = msg.get("chat_type") or inner.get("chat_type")
     chat_id = msg.get("chat_id") or inner.get("chat_id")
     msg_type = msg.get("message_type") or inner.get("message_type")
+    message_id = msg.get("message_id") or inner.get("message_id")
     content_raw = msg.get("content") or inner.get("content")
+    # 飞书把 mentions 放在 message.mentions：[{key:"@_user_1", id:{open_id:"ou_xxx"}, ...}]
+    # text 里则是 "@_user_1 你好"，要在分发后用 key 替换成空。
+    mentions = msg.get("mentions") or inner.get("mentions") or []
 
     text = None
     if msg_type == "text" and content_raw:
@@ -107,10 +122,46 @@ def extract_message(evt_line: str) -> dict | None:
         "sender_id": sender_id,
         "chat_type": chat_type,
         "chat_id": chat_id,
+        "message_id": message_id,
         "msg_type": msg_type,
         "text": text,
+        "mentions": mentions,
         "raw": raw,
     }
+
+
+def _mention_open_ids(mentions: list) -> set[str]:
+    """从 mentions 数组里抠所有被 @ 的 open_id。
+
+    每个元素结构：`{key:"@_user_N", id:{open_id:"ou_xxx"|...}, name, tenant_key}`。
+    id 也可能扁平成字符串（不同 lark-cli 版本 projection 差异），都兜底。
+    """
+    out: set[str] = set()
+    for m in mentions or []:
+        if not isinstance(m, dict):
+            continue
+        ident = m.get("id")
+        if isinstance(ident, dict):
+            oid = ident.get("open_id") or ident.get("user_id")
+            if isinstance(oid, str) and oid:
+                out.add(oid)
+        elif isinstance(ident, str) and ident:
+            out.add(ident)
+    return out
+
+
+# `@_user_1`、`@_user_12` 之类的 mention 占位。飞书在 text 里就是这种形式，
+# 真实姓名 / open_id 都在 mentions 数组里。@_all 是 "@所有人"，也一并剥掉。
+_MENTION_PLACEHOLDER_RE = re.compile(r"@_(?:user_\d+|all)")
+
+
+def strip_mention_placeholders(text: str) -> str:
+    """剔掉 `@_user_N` / `@_all` 占位并折叠多余空白。"""
+    if not text:
+        return text
+    cleaned = _MENTION_PLACEHOLDER_RE.sub("", text)
+    # 连续空格 / 占位前后空白都折掉，免得后续 URL 抽取和命令匹配被空白扰动
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 # --- main loop ---------------------------------------------------------------
@@ -150,8 +201,10 @@ async def stream_events() -> AsyncIterator[str]:
 
 
 async def handle(evt: dict) -> None:
-    if evt["chat_type"] != "p2p":
-        return  # group chats are out of scope
+    chat_type = evt["chat_type"]
+    if chat_type not in ("p2p", "group"):
+        log("skip_unknown_chat_type", chat_type=chat_type)
+        return
     if evt["msg_type"] != "text":
         log("skip_non_text", msg_type=evt["msg_type"])
         return
@@ -159,6 +212,27 @@ async def handle(evt: dict) -> None:
     if not sender:
         log("skip_no_sender")
         return
+
+    # 群里只跑 human 路径，且必须 @bot 才触发：群是吵闹环境，没有 mention gate
+    # 一开机器人就会被普通聊天卷进去刷屏。collab/envelope 协议在双 agent DM 里
+    # 跑，群里出现 envelope 是配置错误，直接忽略掉更安全。
+    if chat_type == "group":
+        if not BOT_OPEN_ID:
+            log("skip_group_no_bot_open_id")
+            return
+        if BOT_OPEN_ID not in _mention_open_ids(evt.get("mentions") or []):
+            return  # 群里没 @ 我，沉默就是金
+        if sender not in HUMAN_SENDERS:
+            log("skip_group_untrusted_sender", sender=sender)
+            return
+        # 复制 evt 后剥掉 mention 占位，下游拿到的 text 是纯净的问题文本。
+        # 不 in-place 改是为了原 raw 给日志/调试留底。
+        evt = {**evt, "text": strip_mention_placeholders(evt.get("text") or "")}
+        log("human_in_group", sender=sender, chat_id=evt.get("chat_id"))
+        await agent_collab.handle_human_doc_qa(evt)
+        return
+
+    # p2p 路径：保留原有 collab / human 双分流
     if sender in COLLAB_SENDERS:
         log("collab_in", sender=sender)
         await agent_collab.handle_doc_qa(evt)
@@ -174,6 +248,8 @@ async def handle(evt: dict) -> None:
 async def main() -> None:
     if not COLLAB_SENDERS and not HUMAN_SENDERS:
         log("warn_no_senders_configured")
+    if not BOT_OPEN_ID:
+        log("warn_no_bot_open_id_group_chats_disabled")
     async for line in stream_events():
         if not line.strip():
             continue

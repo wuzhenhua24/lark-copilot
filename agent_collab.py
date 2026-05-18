@@ -694,24 +694,49 @@ def _get_session_manager() -> SessionManager:
     return _session_manager
 
 
-async def send_text_reply(chat_id: str, text: str) -> None:
-    """以 bot 身份发一条富文本 DM。
+async def send_text_reply(
+    chat_id: str,
+    text: str,
+    *,
+    reply_to_message_id: str | None = None,
+) -> None:
+    """以 bot 身份发一条富文本回复。
 
     用 --markdown 而不是 --text：lark-cli 会自动包成飞书 post 富文本，
     `**bold**`、有序/无序列表、`` `code` ``、链接等 markdown 语法在客户端会真渲染；
     纯文本走 --markdown 也无副作用（没语法字符就跟纯文本一样）。
 
+    群聊（传 `reply_to_message_id`）走 `+messages-reply --reply-in-thread`，让
+    回复进入原消息的 thread，不会污染主聊天流。DM（没传 message_id）继续走
+    `+messages-send` 发到 chat-id，跟之前行为完全一致。
+
     envelope 路径（agent ↔ agent，对端 agent 要按文本 JSON 解析）必须继续走
     --text，本函数仅给 Human 模式用，所以这里可以放心切。
     """
-    cmd = [
-        LARK_CLI, "im", "+messages-send",
-        "--as", "bot",
-        "--chat-id", chat_id,
-        "--markdown", text,
-    ]
+    if reply_to_message_id:
+        cmd = [
+            LARK_CLI, "im", "+messages-reply",
+            "--as", "bot",
+            "--message-id", reply_to_message_id,
+            "--reply-in-thread",
+            "--markdown", text,
+        ]
+        log_event_dry = "dry_run_send_text_reply"
+        log_event_ok = "send_text_reply_ok"
+        log_event_fail = "send_text_reply_failed"
+    else:
+        cmd = [
+            LARK_CLI, "im", "+messages-send",
+            "--as", "bot",
+            "--chat-id", chat_id,
+            "--markdown", text,
+        ]
+        log_event_dry = "dry_run_send_text"
+        log_event_ok = "send_text_ok"
+        log_event_fail = "send_text_failed"
     if DRY_RUN:
-        log("dry_run_send_text", chat_id=chat_id, cmd=" ".join(shlex.quote(c) for c in cmd))
+        log(log_event_dry, chat_id=chat_id, message_id=reply_to_message_id,
+            cmd=" ".join(shlex.quote(c) for c in cmd))
         return
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -721,13 +746,14 @@ async def send_text_reply(chat_id: str, text: str) -> None:
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         log(
-            "send_text_failed",
+            log_event_fail,
             chat_id=chat_id,
+            message_id=reply_to_message_id,
             rc=proc.returncode,
             stderr=stderr.decode(errors="replace")[:300],
         )
     else:
-        log("send_text_ok", chat_id=chat_id)
+        log(log_event_ok, chat_id=chat_id, message_id=reply_to_message_id)
 
 
 async def _run_client_turn(client: ClaudeSDKClient, user_msg: str) -> str:
@@ -743,10 +769,19 @@ async def _run_client_turn(client: ClaudeSDKClient, user_msg: str) -> str:
 
 
 async def handle_human_doc_qa(evt: dict) -> None:
-    """处理真人 DM 的多轮 doc QA。
+    """处理真人 DM / 群聊 @bot 的多轮 doc QA。
 
     输入：自然语言（可贴 0-N 个飞书 URL + 可选问题）。
     输出：纯文本答案 / 加载确认 / 错误提示。
+
+    群聊 vs DM：
+    - DM：所有回复走 `+messages-send` 到 chat_id（行为不变）。
+    - 群聊：所有回复走 `+messages-reply --reply-in-thread`，挂在用户那条 @bot
+      消息的 thread 下，不污染主聊天流。mention 占位 `@_user_N` 由 router 在
+      分发前剥掉，这里看到的 text 已经是纯净的问题文本。
+    - session 仍以 chat_id 为 key，所以同一个群共享一套文档缓存和对话历史。
+      这是有意为之：群成员协作问答时能复用别人加载的文档；如果会冲突，可
+      用 `/reset` 清。
 
     流程（持有 per-chat 锁内）：
     1. 文本是重置命令 → reset session、回确认
@@ -764,6 +799,16 @@ async def handle_human_doc_qa(evt: dict) -> None:
         log("human_doc_qa_no_chat_id")
         return
 
+    # 群里把所有回复都挂到原消息的 thread 上，主聊天流不会被刷屏；DM 不传，
+    # 保持老路径（+messages-send 到 chat-id）。chat_type == "group" 且有 message_id
+    # 才走 thread reply；任一缺失（比如 lark-cli projection 没透出 message_id）都
+    # 优雅降级回 plain send，宁可丑一点也不要发不出去。
+    reply_to = (
+        evt.get("message_id")
+        if evt.get("chat_type") == "group" and evt.get("message_id")
+        else None
+    )
+
     mgr = _get_session_manager()
     lock = await mgr.lock_for(chat_id)
     async with lock:
@@ -774,6 +819,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
                 "✅ 已重置对话。下次贴一个飞书文档链接 + 问题开始新一轮。"
                 if ok else
                 "目前没有活跃对话可以重置。直接贴文档 + 问题就行。",
+                reply_to_message_id=reply_to,
             )
             log("human_doc_qa_reset", chat_id=chat_id, had_session=ok)
             return
@@ -784,7 +830,11 @@ async def handle_human_doc_qa(evt: dict) -> None:
         question = strip_urls(text)
 
         if not urls and not question:
-            await send_text_reply(chat_id, "消息是空的。请把问题（和文档链接）发过来。")
+            await send_text_reply(
+                chat_id,
+                "消息是空的。请把问题（和文档链接）发过来。",
+                reply_to_message_id=reply_to,
+            )
             return
 
         # 拉新文档
@@ -797,13 +847,18 @@ async def handle_human_doc_qa(evt: dict) -> None:
                         timeout=DOC_FETCH_TIMEOUT_SEC,
                     )
                 except asyncio.TimeoutError:
-                    await send_text_reply(chat_id, f"⌛ 拉文档超时：{url}")
+                    await send_text_reply(
+                        chat_id,
+                        f"⌛ 拉文档超时：{url}",
+                        reply_to_message_id=reply_to,
+                    )
                     log("human_doc_qa_fetch_timeout", chat_id=chat_id, url=url)
                     return
                 except Exception as ex:  # noqa: BLE001
                     await send_text_reply(
                         chat_id,
                         f"❌ 拉文档失败：{url}\n{type(ex).__name__}: {str(ex)[:200]}",
+                        reply_to_message_id=reply_to,
                     )
                     log("human_doc_qa_fetch_error", chat_id=chat_id, url=url, error=str(ex)[:300])
                     return
@@ -845,6 +900,7 @@ async def handle_human_doc_qa(evt: dict) -> None:
             await send_text_reply(
                 chat_id,
                 f"❌ 启动模型失败：{type(ex).__name__}: {str(ex)[:200]}",
+                reply_to_message_id=reply_to,
             )
             log("session_client_spawn_failed", chat_id=chat_id, error=str(ex)[:300])
             return
@@ -879,11 +935,16 @@ async def handle_human_doc_qa(evt: dict) -> None:
             await send_text_reply(
                 chat_id,
                 "⌛ 推理超时。文档可能太长，或者临时网络抖了一下。可以试着 /reset 重开或简化问题。",
+                reply_to_message_id=reply_to,
             )
             log("human_doc_qa_timeout", chat_id=chat_id, took_ms=int((time.time() - started) * 1000))
             return
         except Exception as ex:  # noqa: BLE001
-            await send_text_reply(chat_id, f"❌ 模型出错：{type(ex).__name__}: {str(ex)[:200]}")
+            await send_text_reply(
+                chat_id,
+                f"❌ 模型出错：{type(ex).__name__}: {str(ex)[:200]}",
+                reply_to_message_id=reply_to,
+            )
             log("human_doc_qa_error", chat_id=chat_id, error=str(ex)[:300])
             return
 
@@ -891,7 +952,11 @@ async def handle_human_doc_qa(evt: dict) -> None:
             sess.docs_in_client_context.add(url)
         sess.touch()
 
-        await send_text_reply(chat_id, answer or "（模型未输出文本）")
+        await send_text_reply(
+            chat_id,
+            answer or "（模型未输出文本）",
+            reply_to_message_id=reply_to,
+        )
         log(
             "human_doc_qa_done",
             chat_id=chat_id,
