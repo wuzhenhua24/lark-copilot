@@ -106,10 +106,16 @@ def extract_message(evt_line: str) -> dict | None:
     chat_id = msg.get("chat_id") or inner.get("chat_id")
     msg_type = msg.get("message_type") or inner.get("message_type")
     message_id = msg.get("message_id") or inner.get("message_id")
-    # root_id 是飞书话题（thread）的根消息 id。消息在某个话题里时这个字段非空，
-    # 顶层消息（包括"未来即将开新话题的那条 @"）则没有。下游用它把每个话题分桶
-    # 成独立 session：已在话题里→沿用 root_id；新开话题→用本条 message_id 做根。
-    root_id = msg.get("root_id") or inner.get("root_id") or None
+    # 飞书话题（thread）相关字段：root_id 是话题的根消息 id；thread_id 是话题自己的
+    # 独立 id（om_ 前缀）。两者本质都能稳定标识"哪个话题"，下游用哪个都行——拿
+    # 任一非空的当 thread_root。多兜一层是因为 lark-cli 的 event projection 在不同
+    # 版本 / 不同事件 shape 下可能只透 root_id 或只透 thread_id（之前 mentions 就被
+    # 整个吞了同款剧情）。新开话题的顶层消息两个都没有，由下游回退到 message_id。
+    root_id = (
+        msg.get("root_id") or msg.get("thread_id")
+        or inner.get("root_id") or inner.get("thread_id")
+        or None
+    )
     content_raw = msg.get("content") or inner.get("content")
 
     text = None
@@ -234,7 +240,16 @@ async def main() -> None:
         if not evt:
             log("parse_fail", raw=line[:200])
             continue
-        log("event_in", chat_type=evt["chat_type"], msg_type=evt["msg_type"], sender=evt["sender_id"])
+        # message_id / root_id 一并打出来：诊断"话题里追问没沿用 session"这类问题
+        # 一眼就能看出 lark-cli 的事件 projection 有没有透传 root_id。
+        log(
+            "event_in",
+            chat_type=evt["chat_type"],
+            msg_type=evt["msg_type"],
+            sender=evt["sender_id"],
+            message_id=evt.get("message_id"),
+            root_id=evt.get("root_id"),
+        )
         try:
             await handle(evt)
         except Exception as ex:
