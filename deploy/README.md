@@ -230,39 +230,36 @@ sudo systemctl status lark-copilot
 
 ### 5.1 日志在哪
 
-默认配置下日志落到 **`/var/log/lark-copilot/router.log`**（NDJSON，一行一条）。
-目录由 `LogsDirectory=lark-copilot` 在 systemd 启动时自动创建并 chown 到 `User=`。
+走 **journald**（NDJSON 一行一条）。journald 自带持久化 / rotation / 压缩，部署
+零额外依赖。
 
 ```bash
 # 实时跟
-tail -f /var/log/lark-copilot/router.log
+journalctl -u lark-copilot -f
 
-# 结构化筛
-tail -F /var/log/lark-copilot/router.log | jq -c 'select(.event=="human_doc_qa_done")'
+# 最近一小时
+journalctl -u lark-copilot --since "1 hour ago"
 
-# 跨切割文件 grep
-zgrep '"chat_id":"oc_xxx"' /var/log/lark-copilot/router.log*
+# 跨重启
+journalctl -u lark-copilot --since today
 
-# 失败事件聚类（含历史归档）
-zcat -f /var/log/lark-copilot/router.log* | jq -r 'select(.event|test("_failed$|_error$|timeout$")) | .event' | sort | uniq -c
+# 结构化筛：-o cat 去掉 systemd 前缀后给 jq
+journalctl -u lark-copilot -o cat -f | jq -c 'select(.event=="human_doc_qa_done")'
+
+# 看某个 chat 的全部记录
+journalctl -u lark-copilot -o cat --since today | jq -c 'select(.chat_id=="oc_xxx")'
+
+# 失败事件聚类
+journalctl -u lark-copilot -o cat --since today \
+  | jq -r 'select(.event|test("_failed$|_error$|timeout$")) | .event' \
+  | sort | uniq -c
 ```
 
-切割：把 `deploy/lark-copilot.logrotate` 装到 `/etc/logrotate.d/`，默认每天滚一次、
-保留 14 份、gzip 压缩、`copytruncate` 不需重启服务：
-
-```bash
-sudo cp deploy/lark-copilot.logrotate /etc/logrotate.d/lark-copilot
-sudo logrotate -d /etc/logrotate.d/lark-copilot   # dry-run 看一眼
-```
-
-> **想改回走 journald**：把 unit 里 `LogsDirectory=` / `StandardOutput=append:...` /
-> `StandardError=append:...` 三行换回 `StandardOutput=journal` + `StandardError=journal`，
-> 然后 `journalctl -u lark-copilot -f` 取日志即可。
->
-> **想换日志路径**：unit 里 `LogsDirectory=lark-copilot` 决定的就是 `/var/log/<这里>`，
-> 改成别的名字（比如 `lark`）→ 日志目录变 `/var/log/lark/`；同时 append: 后面的路径
-> 和 logrotate 文件里的路径要同步改。要放到 `/var/log` 外部（如 `/data/...`），把
-> `LogsDirectory=` 去掉，改 `ReadWritePaths=/data/lark-copilot` + 自己 mkdir/chown。
+> **想落到独立日志文件而不是 journald**（场景：日志要给第三方采集器 tail）：
+> unit 里把 `StandardOutput=journal` / `StandardError=journal` 换成
+> `StandardOutput=append:/var/log/lark-copilot/router.log` 之类，并加
+> `LogsDirectory=lark-copilot` 让 systemd 自动创建带正确权限的目录。代价是要
+> 自己配 logrotate 切割（systemd append: 不切）；不推荐，journald 已经够用。
 
 ### 5.2 升级
 
