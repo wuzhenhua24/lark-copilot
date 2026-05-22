@@ -1,9 +1,12 @@
 # lark-copilot
 
-飞书侧的 **doc QA worker**。两条路径走同一套"拉飞书文档 + Claude 单轮 QA"管道：
+飞书侧的 **doc QA worker**。核心是一套"拉飞书文档 + Claude 单轮 QA（按需看图）"管道，对外有三种接入方式：
 
-- **Agent 模式**：内网部署的 [ops-qa-bot](../ops-qa-bot) 发结构化 envelope 过来，回 envelope ack
-- **Human 模式**：白名单里的真人 DM 一段"飞书 URL + 问题"，回纯文本答案
+- **HTTP API**（`http_api.py`）：同内网的 peer agent 直接 `POST /doc_qa`，同步拿 answer。**peer agent 推荐走这条**——见下方 [HTTP API](#http-api)
+- **Agent 模式 envelope-over-IM**（`router.py`）：跨网 / 无 HTTP 通道时的退路，peer agent 发结构化 envelope DM 过来，回 envelope ack
+- **Human 模式**（`router.py`）：白名单里的真人 DM / 群里 @bot 发"飞书 URL + 问题"，回文本答案（支持多轮）
+
+`http_api.py` 和 `router.py` 是两个独立进程，可同机各跑一个 systemd unit，互不影响。
 
 基于 [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) +
 [lark-cli](https://github.com/larksuite/lark-cli) 搭建。
@@ -94,6 +97,58 @@ A: rpc.try_deliver 命中 req_id → 唤醒 await 的 Future → tool 返回 ans
 
 ---
 
+## HTTP API
+
+给**同内网、HTTP 可达**的 peer agent 用的同步接口（`http_api.py`）。相比 envelope-over-IM：
+不用飞书当 broker、不用 req_id 关联、不用 listen 回复 DM；结构化 JSON 响应，没有 IM 的
+~28KB 字节上限，`answer` 不截断。
+
+> **什么时候用哪条**：peer 与本服务 HTTP 互达 → 走 HTTP（更简洁）。peer 在隔离网段、
+> 只有飞书这一条双向通道 → 退回 envelope-over-IM。两条路径共用同一套 doc QA 核心。
+
+**身份**：本进程不订阅飞书事件，只 `docs +fetch` / `docs +media-download`，全程 `--as user`，
+不需要 bot 身份。
+
+### `POST /doc_qa`
+
+请求体：
+
+```json
+{"docs": ["<feishu-url-or-token>", "..."], "q": "<question>", "req_id": "<可选>"}
+```
+
+成功（200）：
+
+```json
+{"ok": true, "req_id": "<uuid12>", "answer": "<markdown>", "took_ms": 1234}
+```
+
+失败：`504`（拉文档 / 推理超时）、`500`（其它异常）均为 `{"ok": false, "req_id", "error", "took_ms"}`；
+`401`（鉴权失败）、`422`（参数校验失败，如 `docs` 为空）。
+
+文档里的图以 `<image idx="N"/>` 占位喂给模型，模型按需调 `fetch_doc_image` 实拉图字节看图作答
+（跨文档全局连续编号，软上限 `MAX_IMAGES_PER_QUESTION`）。`answer` 是 markdown 文本。
+
+### `GET /healthz`
+
+存活探针，返回 `{"ok": true}`，不鉴权。
+
+### 鉴权
+
+`HTTP_API_TOKEN` 设了就要求请求带 `Authorization: Bearer <token>`（常量时间比较）；
+留空则放行并在启动时打 `warn_no_http_token`——仅限可信内网测试，**上线务必配上**。
+
+### 调用示例
+
+```bash
+curl -s http://<host>:8800/doc_qa \
+  -H "Authorization: Bearer $HTTP_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"docs":["https://xxx.feishu.cn/docx/xxxxx"],"q":"这份文档讲了啥"}'
+```
+
+---
+
 > **要部署到生产**：完整的端到端 runbook 见 [`deploy/README.md`](deploy/README.md)
 > （飞书应用配置 → 部署机环境 → env → smoke test → systemd → 回滚）。本文档保留
 > 概念解释和快速本地试跑，不重复展开部署步骤。
@@ -165,13 +220,16 @@ uv sync
 | `INFERENCE_TIMEOUT_SEC` | 单轮模型推理的硬超时，含 fetch_doc_image 工具 round-trip，默认 120s |
 | `SESSION_TTL_MIN` | Human 模式会话空闲多少分钟后被回收，默认 30 |
 | `MAX_IMAGES_PER_QUESTION` | 单次问题里 Claude 最多通过 fetch_doc_image 工具拉几张图，默认 3 |
-| `DRY_RUN` | `1` 只 log 不真发回复；`0` 真发。**首次跑保持 1。** |
+| `DRY_RUN` | `1` 只 log 不真发回复；`0` 真发。**首次跑保持 1。**（仅 router） |
 | `LARK_CLI` | lark-cli 可执行路径，默认 `lark-cli` |
+| `HTTP_HOST` / `HTTP_PORT` | HTTP API 监听地址 / 端口，默认 `127.0.0.1` / `8800`。跨机调用改成 `0.0.0.0` 或内网网卡 IP |
+| `HTTP_API_TOKEN` | HTTP API 的 Bearer token；留空放行（仅内网测试），上线务必配 |
 
-跑起来：
+跑起来（两个进程按需各起）：
 
 ```bash
-uv run python router.py
+uv run python router.py     # 飞书事件监听（Agent / Human 模式）
+uv run python http_api.py   # HTTP API（peer agent 直接调用），默认 127.0.0.1:8800
 ```
 
 输出 NDJSON 日志，每行一个事件。关键事件：
@@ -243,7 +301,9 @@ lark-copilot/
 ├── pyproject.toml     依赖声明（uv 管理）
 ├── .env.example       配置模板
 ├── router.py          薄 dispatcher：event consume → 按 sender 白名单 → agent_collab
-└── agent_collab.py    doc QA 主体：fetch 文档 + Claude QA + 回 ack envelope / 纯文本
+├── http_api.py        HTTP API：POST /doc_qa（同内网 peer agent 直接调用）→ agent_collab
+├── agent_collab.py    doc QA 主体：fetch 文档 + Claude QA（按需看图）+ 回 ack envelope / 纯文本
+└── deploy/            systemd unit（router 一份、http_api 一份）+ 部署 runbook
 ```
 
 ---

@@ -124,6 +124,12 @@ cp .env.example .env
 | `SESSION_TTL_MIN` | 否 | Human/群聊 会话空闲多少分钟回收，默认 30 |
 | `MAX_IMAGES_PER_QUESTION` | 否 | 单轮最多拉几张图，默认 3 |
 | `LARK_CLI` | 否 | lark-cli 可执行路径，默认 `lark-cli`（PATH 上能找到就不用改） |
+| `HTTP_HOST` | 跑 HTTP API 才用 | HTTP API 监听地址，默认 `127.0.0.1`；**跨机调用必须**改成 `0.0.0.0` 或内网网卡 IP，否则 peer 连不上 |
+| `HTTP_PORT` | 跑 HTTP API 才用 | HTTP API 端口，默认 `8800` |
+| `HTTP_API_TOKEN` | 跑 HTTP API 才用 | Bearer token；留空放行（仅内网测试），**上线务必配**。生成：`python -c "import secrets;print(secrets.token_urlsafe(32))"` |
+
+> `DRY_RUN` 只作用于 router（IM 回复）。HTTP API 是同步返回，没有 DRY_RUN 概念。
+> HTTP API 复用 `DOC_FETCH_TIMEOUT_SEC` / `INFERENCE_TIMEOUT_SEC` / `MAX_IMAGES_PER_QUESTION`。
 
 ### 3.1 怎么拿 open_id
 
@@ -214,6 +220,31 @@ DRY_RUN=0
 
 重启进程。再发一条测消息，应在飞书客户端真收到回复。
 
+### 4.6 HTTP API smoke test（如果跑 HTTP 接口）
+
+前台起 HTTP API（和 router 是两个独立进程）：
+
+```bash
+uv run python http_api.py
+# 启动日志：{"event":"http_starting","host":"127.0.0.1","port":8800}
+# 没配 token 会先打 {"event":"warn_no_http_token",...}
+```
+
+另开一个终端打探针 + 一次真实问答（`docs +fetch` 用的是已 `auth login` 的 user 身份）：
+
+```bash
+curl -s http://127.0.0.1:8800/healthz
+# {"ok":true}
+
+curl -s http://127.0.0.1:8800/doc_qa \
+  -H "Authorization: Bearer $HTTP_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"docs":["<一篇你有权限的飞书文档 url>"],"q":"这份文档讲了啥"}'
+# {"ok":true,"req_id":"...","answer":"...","took_ms":...}
+```
+
+服务端日志应出现 `http_doc_qa_in → http_doc_fetched → http_doc_qa_done`。
+
 ---
 
 ## 5. systemd 常驻（Linux 生产）
@@ -227,6 +258,19 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now lark-copilot
 sudo systemctl status lark-copilot
 ```
+
+**跑 HTTP API 的话**，再装一份独立 unit（`deploy/lark-copilot-api.service`，跑 `http_api.py`）。
+两个 unit 相互独立、可同机并跑，按需启用其一或都启用：
+
+```bash
+sudo cp deploy/lark-copilot-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now lark-copilot-api
+journalctl -u lark-copilot-api -f
+```
+
+日志 / 升级（§5.1、§5.2）对两个 unit 一致，把 `-u lark-copilot` 换成 `-u lark-copilot-api` 即可；
+升级时记得两个都 `restart`。
 
 ### 5.1 日志在哪
 
@@ -285,6 +329,9 @@ sudo systemctl restart lark-copilot
 | A 调工具后超时 | (a) B 没起 / (b) B 还在 DRY_RUN=1（不会真回） / (c) `COLLAB_SENDERS` 没含 A 的 bot open_id |
 | 答案过长被截 | B 自动按 ~28KB 字节裁 `answer` 字段并打 `truncated:true`；要完整内容打开原文档 |
 | 媒体下载（图）超时 | 部分网络下 `docs +media-download` 走 https_proxy 会 TLS handshake 超时。`.env` 里取消注释 `LARK_CLI_NO_PROXY=1` 让它绕代理 |
+| HTTP API peer 连不上 | `HTTP_HOST` 还是默认 `127.0.0.1`，只听本机；跨机调用改成 `0.0.0.0` 或内网网卡 IP 并重启。也确认防火墙放行了 `HTTP_PORT` |
+| HTTP API 全返回 401 | 服务端配了 `HTTP_API_TOKEN` 但调用方没带 / 带错 `Authorization: Bearer <token>` |
+| HTTP API `/doc_qa` 报 500 | 多半是 `docs +fetch` 失败（同"`lark-cli docs +fetch` 失败"那行排查）；`error` 字段有具体类型 |
 | Windows 部署 | 见根 README 的 "Windows 部署须知" 小节 |
 
 诊断的第一手段：把 `event_in` 那一行的 `raw` 字段也打出来看完整事件载荷。
