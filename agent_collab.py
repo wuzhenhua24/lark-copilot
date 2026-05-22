@@ -525,11 +525,13 @@ def _default_summary_question(urls: list[str]) -> str:
 MAX_IMAGES_PER_QUESTION = int(os.environ.get("MAX_IMAGES_PER_QUESTION", "3"))
 
 
-def _build_image_mcp_server(sess: "ChatSession"):
-    """给某个 ChatSession 构造一个进程内 MCP server，暴露 fetch_doc_image 工具。
+def _make_fetch_doc_image_tool(get_images, log_ctx: dict[str, object]):
+    """构造 fetch_doc_image 工具。
 
-    工具实现 closure 抓住 sess，所以同一进程下不同 chat 互不串。
-    返回值给 ClaudeAgentOptions.mcp_servers 用。
+    `get_images()` 在每次调用时返回当前合法的 ImageRef 列表（下标 = idx-1）——
+    多轮 session 传 `lambda: sess.images`（图会随轮次增长，得在调用时实时取）；
+    单轮请求传 `lambda: images`（固定列表）。`log_ctx` 是打日志时带上的定位字段
+    （多轮带 session_key，单轮带 req_id）。
     """
 
     @tool(
@@ -541,26 +543,27 @@ def _build_image_mcp_server(sess: "ChatSession"):
         {"idx": int},
     )
     async def fetch_doc_image(args: dict[str, Any]) -> dict[str, Any]:
+        images = get_images()
         idx = args.get("idx")
-        if not isinstance(idx, int) or idx < 1 or idx > len(sess.images):
+        if not isinstance(idx, int) or idx < 1 or idx > len(images):
             return {
                 "content": [{
                     "type": "text",
-                    "text": f"idx {idx!r} 越界。当前 session 共 {len(sess.images)} 张图（合法范围 1..{len(sess.images)}）。",
+                    "text": f"idx {idx!r} 越界。当前共 {len(images)} 张图（合法范围 1..{len(images)}）。",
                 }],
                 "is_error": True,
             }
-        ref = sess.images[idx - 1]
-        log("fetch_doc_image_start", session_key=sess.session_key, idx=idx, token=ref.token, name=ref.name)
+        ref = images[idx - 1]
+        log("fetch_doc_image_start", **log_ctx, idx=idx, token=ref.token, name=ref.name)
         try:
             data, mime = await download_doc_image(ref.token)
         except Exception as ex:  # noqa: BLE001
-            log("fetch_doc_image_failed", session_key=sess.session_key, idx=idx, error=str(ex)[:300])
+            log("fetch_doc_image_failed", **log_ctx, idx=idx, error=str(ex)[:300])
             return {
                 "content": [{"type": "text", "text": f"下载图 idx={idx} 失败：{type(ex).__name__}: {str(ex)[:200]}"}],
                 "is_error": True,
             }
-        log("fetch_doc_image_ok", session_key=sess.session_key, idx=idx, bytes=len(data), mime=mime)
+        log("fetch_doc_image_ok", **log_ctx, idx=idx, bytes=len(data), mime=mime)
         return {
             "content": [
                 {
@@ -571,7 +574,73 @@ def _build_image_mcp_server(sess: "ChatSession"):
             ],
         }
 
-    return create_sdk_mcp_server(name="lark-doc", tools=[fetch_doc_image])
+    return fetch_doc_image
+
+
+def _build_image_mcp_server(sess: "ChatSession"):
+    """给某个 ChatSession 构造一个进程内 MCP server，暴露 fetch_doc_image 工具。
+
+    工具实现 closure 抓住 sess.images（实时读，图随轮次增长），所以同一进程下
+    不同 chat 互不串。返回值给 ClaudeAgentOptions.mcp_servers 用。
+    """
+    t = _make_fetch_doc_image_tool(lambda: sess.images, {"session_key": sess.session_key})
+    return create_sdk_mcp_server(name="lark-doc", tools=[t])
+
+
+def _build_image_mcp_server_for_request(images: list[ImageRef], *, req_id: str):
+    """单轮 HTTP 请求用：图清单固定，按 req_id 打日志定位。"""
+    t = _make_fetch_doc_image_tool(lambda: images, {"req_id": req_id})
+    return create_sdk_mcp_server(name="lark-doc", tools=[t])
+
+
+async def answer_from_docs(
+    question: str,
+    fetched: list[tuple[str, str, list[ImageRef]]],
+    *,
+    req_id: str,
+) -> str:
+    """单轮 doc QA，模型作答时可按需看图。HTTP /doc_qa 走这条。
+
+    `fetched` 是 `[(url, markdown, imgs), ...]`——通常由若干 `fetch_doc_as_markdown`
+    并发拿到后拼起来。各篇 markdown 里的 `![]()` 占位会按**全局顺序**重写成
+    `<image idx="N"/>`（N 从 1 起，跨文档连续编号），并把所有图汇成一份清单挂到
+    进程内 fetch_doc_image 工具上，模型按需实拉。和多轮 human 路径同一套图协议。
+
+    没有任何图时退化成纯文本单轮（allowed_tools=[]、max_turns=1），等价于旧的
+    `answer_from_doc`。不指定 model：复用部署机 Claude Code 绑定的固定第三方模型。
+    """
+    all_images: list[ImageRef] = []
+    doc_blocks: list[str] = []
+    for url, md, imgs in fetched:
+        # 当前文档第一张图的全局 idx（1-based），重写完再把图并进总清单。
+        start_idx = len(all_images) + 1
+        md_block = rewrite_markdown_image_placeholders(md, imgs, start_idx) if imgs else md
+        all_images.extend(imgs)
+        doc_blocks.append(f'<document url="{url}">\n{md_block}\n</document>')
+
+    use_images = bool(all_images)
+    system_prompt = DOC_QA_SYSTEM_PROMPT + (f"\n\n{_IMAGE_PROTOCOL_NOTE}" if use_images else "")
+    if use_images:
+        options = ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            mcp_servers={"lark-doc": _build_image_mcp_server_for_request(all_images, req_id=req_id)},
+            allowed_tools=["mcp__lark-doc__fetch_doc_image"],
+            # 每拉一张图 = 1 轮工具调用 + 1 轮看图，× 上限再加 1 轮兜底文本回复。
+            max_turns=MAX_IMAGES_PER_QUESTION * 2 + 1,
+        )
+    else:
+        options = ClaudeAgentOptions(system_prompt=system_prompt, allowed_tools=[], max_turns=1)
+
+    parts = [*doc_blocks, f"<question>\n{question}\n</question>"]
+    user_msg = "\n\n".join(parts)
+    out_parts: list[str] = []
+    async for msg in query(prompt=user_msg, options=options):
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    out_parts.append(block.text)
+    answer = "".join(out_parts).strip()
+    return answer or "（模型未输出文本）"
 
 
 @dataclass

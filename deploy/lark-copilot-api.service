@@ -1,0 +1,54 @@
+# lark-copilot HTTP API systemd unit
+#
+# doc QA 的 HTTP 接口（http_api.py）。和 lark-copilot.service（router.py，飞书事件
+# 监听）相互独立，可同机并跑：一个订阅 IM 给真人/群聊用，一个给同内网的 peer agent
+# 直接 HTTP 调用。
+#
+# 用法：
+#   sudo cp deploy/lark-copilot-api.service /etc/systemd/system/
+#   # 改下面四处占位符为本机实际值：User / Group / WorkingDirectory / ExecStart 的 uv 路径
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lark-copilot-api
+#   journalctl -u lark-copilot-api -f
+
+[Unit]
+Description=lark-copilot · feishu doc QA HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# === 改这四个 ===
+User=lark-copilot
+Group=lark-copilot
+WorkingDirectory=/opt/lark-copilot
+ExecStart=/usr/local/bin/uv run python http_api.py
+
+# .env 在 WorkingDirectory 里 (load_dotenv 已经处理)；监听地址/端口/鉴权 token 在
+# .env 里配（HTTP_HOST / HTTP_PORT / HTTP_API_TOKEN）。如果想从 systemd 注入 env：
+# EnvironmentFile=/etc/lark-copilot.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lark-copilot-api
+
+# 异常退出自动重启
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# 优雅停机：uvicorn 收到 SIGTERM 会停止收新连接、等 in-flight 请求完再退。
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+
+# 安全加固（可选，对功能没影响；如果遇到权限问题再放开）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# .venv / 缓存写入需要可写的家目录；如果你把整个仓库都设成只读，下面这行打开
+# ReadWritePaths=/opt/lark-copilot
+
+[Install]
+WantedBy=multi-user.target
