@@ -168,8 +168,9 @@ curl -s http://<host>:8800/doc_qa \
 
 | scope | 身份列 | 用途 |
 |---|---|---|
-| `im:message.p2p_msg:readonly` | **应用身份** | bot 接收 `im.message.receive_v1` 事件（peer 发来的 envelope） |
-| `im:message:send` | **应用身份** | bot 发 ack envelope 回 peer |
+| `im:message.p2p_msg:readonly` | **应用身份** | bot 接收 DM 的 `im.message.receive_v1` 事件（peer 发来的 envelope / 真人 DM 提问） |
+| `im:message.group_at_msg:readonly` | **应用身份** | bot 接收群里 @ 自己的 `im.message.receive_v1` 事件（**群聊模式必需**；只跑 DM/envelope 可不勾） |
+| `im:message:send` | **应用身份** | bot 发 ack envelope / 群里 `+messages-reply` 引用回复 |
 | `docx:document:readonly` | **用户身份** | `lark-cli docs +fetch` 拉飞书文档 |
 | `drive:drive:readonly`（可选） | 用户身份 | 搜云空间文档 |
 
@@ -177,7 +178,7 @@ curl -s http://<host>:8800/doc_qa \
 
 - 网关：**长连接（WebSocket）**（lark-cli event consume 走这条，不需要公网回调）
 - 事件 → 应用身份订阅 → 添加 `im.message.receive_v1`
-- 平台可能强制要求带上 `im:message.group_at_msg:readonly` 等附加 scope，按提示勾上即可
+- 平台可能强制要求带上 `im:resource` 等附加 scope，按提示勾上即可
 
 ### 4. 配 lark-cli + 登录两个身份
 
@@ -222,6 +223,7 @@ uv sync
 | `MAX_IMAGES_PER_QUESTION` | 单次问题里 Claude 最多通过 fetch_doc_image 工具拉几张图，默认 3 |
 | `DRY_RUN` | `1` 只 log 不真发回复；`0` 真发。**首次跑保持 1。**（仅 router） |
 | `LARK_CLI` | lark-cli 可执行路径，默认 `lark-cli` |
+| `LARK_CLI_NO_PROXY` | 置 `1` 让 lark-cli 绕过 `https_proxy`（默认注释掉）。部分网络下 `docs +media-download` 走代理会 TLS handshake 超时、图下载失败但 `docs +fetch` 文本正常——这时打开 |
 | `HTTP_HOST` / `HTTP_PORT` | HTTP API 监听地址 / 端口，默认 `127.0.0.1` / `8800`。跨机调用改成 `0.0.0.0` 或内网网卡 IP |
 | `HTTP_API_TOKEN` | HTTP API 的 Bearer token；留空放行（仅内网测试），上线务必配 |
 
@@ -239,15 +241,17 @@ uv run python http_api.py   # HTTP API（peer agent 直接调用），默认 127
 | `starting` | 启动，附 lark-cli 命令 |
 | `warn_no_senders_configured` | `COLLAB_SENDERS` 和 `HUMAN_SENDERS` 都为空，所有 DM 都会被丢 |
 | `event_in` | 收到一条事件 |
-| `skip_untrusted_sender` | 发件人不在任一白名单 —— 想加入 Human 模式，把这一行的 `sender` 复制到 `HUMAN_SENDERS` |
-| `collab_in` / `human_in` | 命中对应白名单 |
+| `skip_untrusted_sender` | DM 发件人不在任一白名单 —— 想加入 Human 模式，把这一行的 `sender` 复制到 `HUMAN_SENDERS` |
+| `skip_group_untrusted_sender` | 群里 @bot 的发件人不在 `HUMAN_SENDERS`，被丢弃 |
+| `collab_in` / `human_in` | DM 命中对应白名单 |
+| `human_in_group` | 群里 @bot 的发件人命中 `HUMAN_SENDERS`，走 human 路径 |
 | `doc_qa_in` / `doc_fetched` / `doc_qa_done` | envelope 路径的 checkpoint |
-| `session_created` / `session_evict_idle` / `session_client_spawned` | Human 模式 per-chat 会话生命周期 |
+| `session_created` / `session_evict_idle` / `session_client_spawned` | Human 模式 per-session 会话生命周期 |
 | `human_doc_qa_in` / `human_doc_qa_done` | human 路径单轮 checkpoint |
 | `human_doc_qa_fetch` / `human_doc_qa_default_summary` | 文档加载 / 裸 URL 触发默认总结 |
 | `human_doc_qa_reset` | 用户触发了 /reset |
-| `dry_run_send_ack` / `dry_run_send_text` | DRY_RUN 下要发的命令（实际没发） |
-| `send_ack_ok` / `send_text_ok` / `*_failed` | 真实回送结果 |
+| `dry_run_send_ack` / `dry_run_send_text` / `dry_run_send_text_reply` | DRY_RUN 下要发的命令（实际没发；`_reply` 是群里引用回复） |
+| `send_ack_ok` / `send_text_ok` / `send_text_reply_ok` / `*_failed` | 真实回送结果（`_reply` 为群聊引用回复） |
 
 ### Human 模式怎么用（多轮对话版）
 
@@ -334,7 +338,7 @@ lark-copilot/
 | `proc.terminate()` 行为 | Windows 上等同 SIGKILL，lark-cli 拿不到 graceful shutdown 机会。如果遇到 lark-cli event daemon 卡住，手动 `lark-cli event reset` 一下 |
 | DRY_RUN 日志里的命令字符串 | 用的是 Unix shell 引号（`shlex.quote`），**直接复制到 cmd / PowerShell 跑不通**。只是日志展示问题，实际执行走 list-form `create_subprocess_exec`，正常 |
 | lark-cli 二进制 | 用官方 Windows release，丢到 PATH 上即可。`LARK_CLI=lark-cli` 会自动找 `lark-cli.exe` |
-| Claude Code CLI | `ClaudeSDKClient` 依赖部署机的 Claude Code。Windows 装好桌面 app 或 CLI 后 `claude auth login` 跑一次，SDK 自动复用 |
+| Claude Code CLI | `ClaudeSDKClient` 依赖部署机的 Claude Code。Windows 装好桌面 app 或 CLI 后 `claude /login` 跑一次，SDK 自动复用 |
 
 ---
 
@@ -349,7 +353,7 @@ lark-copilot/
 | `warn_no_senders_configured` | `.env` 里 `COLLAB_SENDERS` 和 `HUMAN_SENDERS` 都没填，所有发件人都会被 `skip_untrusted_sender` 丢 |
 | A 调工具后超时 | (a) B 没起 / (b) DRY_RUN=1（B 不会真回） / (c) `COLLAB_SENDERS` 没含 A 的 bot open_id |
 | 答案过长被截 | B 自动按 ~28KB 字节裁 `answer` 字段并打 `truncated:true`；要完整内容打开原文档 |
-| 同一份文档反复被拉 | 本期没做缓存。高频场景可在 B 侧加 docx_token → markdown 的本地 TTL 缓存 |
+| 同一份文档反复被拉 | Human 多轮模式在会话内已有 per-session doc cache（同一会话不重拉）；但 envelope / HTTP 单次请求路径每次都重新拉。高频协作场景可在 B 侧加跨请求的 docx_token → markdown 本地 TTL 缓存 |
 
 需要看更详细的事件载荷，把 `event_in` 那行的 `raw` 字段也打出来即可。
 
@@ -357,6 +361,6 @@ lark-copilot/
 
 ## 后续规划
 
-- 文档拉取缓存层 —— 高频协作值得加
+- 跨请求的文档拉取缓存层 —— Human 多轮已有 per-session 缓存，envelope / HTTP 路径仍每次重拉，高频协作值得补一层共享 TTL 缓存
 - 多 capability 工作流：让 router 支持多个 handler，比如 sheet QA、bitable 查询
 - 文档起草：基于 lark-doc skill，把 envelope 里的需求草拟成文档

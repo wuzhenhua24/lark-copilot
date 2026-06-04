@@ -136,7 +136,7 @@ cp .env.example .env
 **真人 sender 的 open_id（填 `HUMAN_SENDERS`）**
 
 ```bash
-# 1. 临时起 router（DRY_RUN=1，HUMAN_SENDERS/BOT_OPEN_ID 都先留空）
+# 1. 临时起 router（DRY_RUN=1，COLLAB_SENDERS/HUMAN_SENDERS 都先留空）
 uv run python router.py
 # 2. 用你**真人**飞书账号 DM bot 一句话（随便发一条文本）
 # 3. 日志里找 `skip_untrusted_sender`，复制 `sender` 字段（形如 ou_xxxx）
@@ -166,7 +166,6 @@ uv run python router.py
 不应出现：
 
 - `warn_no_senders_configured` —— 两个白名单都没填
-- `warn_no_bot_open_id_group_chats_disabled` —— 没填 `BOT_OPEN_ID`，群聊禁用
 - `consume_exited rc=...` —— 进程退出，看 §6 排查
 
 ### 4.2 DM smoke test
